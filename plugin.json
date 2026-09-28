@@ -1,0 +1,32 @@
+{
+  "name": "Spotify Universal Importer",
+  "safe_name": "spotify-importer",
+  "version": "1.0.0",
+  "author": "Kesavaraj",
+  "description": "High-speed Spotify importer supporting entire playlists (no 500-song limit), albums, and single tracks with custom save destination.",
+  "type": "js",
+  "entry": "index.js",
+  "permissions": [
+    "network:fetch",
+    "ui:inject",
+    "library:write",
+    "library:read",
+    "storage:local",
+    "player:read",
+    "player:control",
+    "system:notify"
+  ],
+  "category": "utility",
+  "tags": [
+    "spotify",
+    "importer",
+    "playlist",
+    "converter",
+    "single-track",
+    "downloader"
+  ],
+  "homepage": "https://github.com/kesavarajsamipillai/spotify-universal-importer",
+  "repo": "https://github.com/kesavarajsamipillai/spotify-universal-importer",
+  "repository": "https://github.com/kesavarajsamipillai/spotify-universal-importer",
+  "license": "MIT"
+}
