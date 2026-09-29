@@ -1,7 +1,7 @@
 {
   "name": "Spotify Universal Importer",
   "safe_name": "spotify-importer",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "Kesavaraj",
   "description": "High-speed Spotify importer supporting entire playlists (no 500-song limit), albums, and single tracks with custom save destination.",
   "type": "js",
