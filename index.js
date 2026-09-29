@@ -1,432 +1,119 @@
-// Spotify Universal Importer for Audion
-// Supports:
-// 1. Unlimited playlist length (fixes 499-song cutoff bug with full pagination)
-// 2. Full Albums
-// 3. Single Songs with interactive "Where to save?" destination picker
-// 4. Hybrid API mode (Zero-config public scraper + Optional official Spotify Developer API for 5000+ tracks)
-// 5. High-speed multi-threaded source matching (JioSaavn, Qobuz, etc.)
-
 (function () {
     'use strict';
 
     const SpotifyImporter = {
         name: 'Spotify Universal Importer',
         api: null,
+
         isOpen: false,
         isConverting: false,
-        stopRequested: false,
+        stopConversion: false,
         abortController: null,
+        importedPlaylistData: null,
+        singleTrackData: null,
+        detectedType: null, // 'playlist' | 'track' | 'album'
 
-        // Active State
-        parsedItem: null, // { type: 'track' | 'playlist' | 'album', id: string, rawUrl: string }
-        pendingTrackData: null, // For single song save picker
-        cachedPlaylists: [],
+        NEW_SPOTIFY_API_BASE: 'https://spotify-api-henna.vercel.app/api/playlist',
         trackCache: new Map(),
-
-        // Settings (Persisted via api.storage)
-        settings: {
-            clientId: '',
-            clientSecret: '',
-            concurrency: 6, // 6 concurrent searches for high speed
-            autoPlayOnSingle: false
-        },
-
-        spotifyAccessToken: null,
-        tokenExpiryTime: 0,
-
-        // Public fallback endpoint
-        PUBLIC_PLAYLIST_API: 'https://spotify-api-henna.vercel.app/api/playlist',
-
-        // ── Lifecycle Hooks ──────────────────────────────────────────
+        cachedPlaylists: [],
 
         async init(api) {
             console.log('[SpotifyImporter] Initializing...');
             this.api = api;
-
-            // Load saved settings
-            await this.loadSettings();
-
-            // Inject CSS styles
             this.injectStyles();
-
-            // Build DOM modal and register buttons
             this.createModal();
-            this.createUIButtons();
-
+            this.createMenuButton();
             console.log('[SpotifyImporter] Ready.');
         },
 
-        start() {
-            console.log('[SpotifyImporter] Started.');
+        // ── Smart Multi-Stage Source Search ─────────────────────────────────
+        async searchAllSources(spotifyTrack, signal) {
+            // Stage 1: Exact search
+            let results = await this.querySearch(
+                { title: spotifyTrack.title, artist: spotifyTrack.artist, isrc: spotifyTrack.isrc, duration_ms: spotifyTrack.duration_ms },
+                signal
+            );
+            if (results.some(r => r.status === 'success')) return results;
+
+            // Stage 2: Clean title & artist (remove "(Female Version)", "[Official]", "- From...", featured artists)
+            const cleanTitle = this.cleanSongTitle(spotifyTrack.title);
+            const cleanArtist = this.cleanArtistName(spotifyTrack.artist);
+
+            if (cleanTitle !== spotifyTrack.title || cleanArtist !== spotifyTrack.artist) {
+                results = await this.querySearch(
+                    { title: cleanTitle, artist: cleanArtist, duration_ms: spotifyTrack.duration_ms },
+                    signal
+                );
+                if (results.some(r => r.status === 'success')) return results;
+            }
+
+            // Stage 3: Combined string search query
+            results = await this.querySearch(
+                { title: `${cleanTitle} ${cleanArtist}`.trim() },
+                signal
+            );
+            if (results.some(r => r.status === 'success')) return results;
+
+            // Stage 4: Title only search
+            if (cleanTitle.length > 2) {
+                results = await this.querySearch(
+                    { title: cleanTitle },
+                    signal
+                );
+            }
+
+            return results;
         },
 
-        stop() {
-            console.log('[SpotifyImporter] Stopping...');
-            this.stopConversion();
-            if (this.api?.ui?.unregisterSlot) {
-                this.api.ui.unregisterSlot('playerbar:right');
-                this.api.ui.unregisterSlot('playerbar:menu');
-            }
-            const modal = document.getElementById('sui-overlay');
-            if (modal && modal.parentNode) modal.parentNode.removeChild(modal);
-            const styles = document.getElementById('sui-styles');
-            if (styles && styles.parentNode) styles.parentNode.removeChild(styles);
-        },
-
-        // ── Settings & Storage ───────────────────────────────────────
-
-        async loadSettings() {
-            if (!this.api?.storage?.get) return;
-            try {
-                const data = await this.api.storage.get('sui_config');
-                if (data) {
-                    const parsed = typeof data === 'string' ? JSON.parse(data) : data;
-                    this.settings = Object.assign(this.settings, parsed);
-                }
-            } catch (err) {
-                console.warn('[SpotifyImporter] Failed to load settings:', err);
-            }
-        },
-
-        async saveSettings() {
-            if (!this.api?.storage?.set) return;
-            try {
-                await this.api.storage.set('sui_config', JSON.stringify(this.settings));
-            } catch (err) {
-                console.warn('[SpotifyImporter] Failed to save settings:', err);
-            }
-        },
-
-        // ── Spotify Auth & Token Management ──────────────────────────
-
-        async getSpotifyToken() {
-            // Check if user has entered custom developer credentials
-            if (!this.settings.clientId || !this.settings.clientSecret) {
-                return null;
-            }
-
-            // Return cached token if valid
-            if (this.spotifyAccessToken && Date.now() < this.tokenExpiryTime) {
-                return this.spotifyAccessToken;
-            }
-
-            try {
-                const creds = btoa(`${this.settings.clientId.trim()}:${this.settings.clientSecret.trim()}`);
-                const res = await this.api.fetch('https://accounts.spotify.com/api/token', {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Basic ${creds}`,
-                        'Content-Type': 'application/x-www-form-urlencoded'
-                    },
-                    body: 'grant_type=client_credentials'
-                });
-
-                if (!res.ok) {
-                    throw new Error(`Spotify Auth HTTP ${res.status}`);
-                }
-
-                const data = await res.json();
-                if (data.access_token) {
-                    this.spotifyAccessToken = data.access_token;
-                    // Token lasts 3600 seconds, expire 2 minutes early
-                    this.tokenExpiryTime = Date.now() + ((data.expires_in || 3600) - 120) * 1000;
-                    this.log('Acquired official Spotify API token', 'success');
-                    return this.spotifyAccessToken;
-                }
-            } catch (err) {
-                this.log(`Spotify Token Error: ${err.message}. Falling back to public resolver.`, 'warn');
-            }
-
-            return null;
-        },
-
-        // ── URL & Identifier Parsing ─────────────────────────────────
-
-        parseSpotifyInput(input) {
-            if (!input || typeof input !== 'string') return null;
-            const str = input.trim();
-
-            // URI matching: spotify:track:..., spotify:playlist:..., spotify:album:...
-            const uriMatch = str.match(/^spotify:(track|playlist|album):([a-zA-Z0-9]+)/);
-            if (uriMatch) {
-                return { type: uriMatch[1], id: uriMatch[2], rawUrl: str };
-            }
-
-            // Web URL matching
-            const urlMatch = str.match(/spotify\.com\/(track|playlist|album)\/([a-zA-Z0-9]+)/);
-            if (urlMatch) {
-                return { type: urlMatch[1], id: urlMatch[2], rawUrl: str };
-            }
-
-            return null;
-        },
-
-        // ── Metadata Fetchers ────────────────────────────────────────
-
-        // 1. Fetch Single Track
-        async fetchTrack(trackId, rawUrl) {
-            this.log(`Fetching metadata for single track (ID: ${trackId})...`, 'info');
-            const token = await this.getSpotifyToken();
-
-            // Option A: Official Web API
-            if (token) {
-                try {
-                    const res = await this.api.fetch(`https://api.spotify.com/v1/tracks/${trackId}`, {
-                        headers: { 'Authorization': `Bearer ${token}` }
-                    });
-                    if (res.ok) {
-                        const t = await res.json();
-                        return {
-                            title: t.name,
-                            artist: t.artists.map(a => a.name).join(', '),
-                            album: t.album?.name || '',
-                            duration_ms: t.duration_ms,
-                            cover_url: t.album?.images?.[0]?.url || null,
-                            isrc: t.external_ids?.isrc || null,
-                            rawUrl: t.external_urls?.spotify || rawUrl
-                        };
-                    }
-                } catch (e) {
-                    console.warn('[SpotifyImporter] Official API track fetch error:', e);
-                }
-            }
-
-            // Option B: Public oEmbed / Scraper (Instant zero-config)
-            try {
-                const targetUrl = rawUrl.startsWith('http') ? rawUrl : `https://open.spotify.com/track/${trackId}`;
-                const oembedRes = await this.api.fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(targetUrl)}`);
-                if (oembedRes.ok) {
-                    const data = await oembedRes.json();
-                    let title = data.title || 'Unknown Track';
-                    let artist = 'Unknown Artist';
-
-                    // Parse "Title - Artist" or "Title by Artist" if present
-                    if (title.includes(' by ')) {
-                        const parts = title.split(' by ');
-                        title = parts[0].trim();
-                        artist = parts[1].trim();
-                    } else if (title.includes(' - ')) {
-                        const parts = title.split(' - ');
-                        artist = parts[0].trim();
-                        title = parts[1].trim();
-                    }
-
-                    return {
-                        title: title,
-                        artist: artist,
-                        album: '',
-                        duration_ms: 180000,
-                        cover_url: data.thumbnail_url || null,
-                        isrc: null,
-                        rawUrl: targetUrl
-                    };
-                }
-            } catch (err) {
-                console.error('[SpotifyImporter] oEmbed fallback failed:', err);
-            }
-
-            throw new Error(`Could not fetch metadata for Spotify track: ${trackId}`);
-        },
-
-        // 2. Fetch Playlist (Fixes 499 cutoff by handling unlimited pagination)
-        async fetchPlaylist(playlistId) {
-            this.log(`Fetching playlist (ID: ${playlistId})...`, 'info');
-            const token = await this.getSpotifyToken();
-
-            // Option A: Official Web API (Supports 10,000+ tracks with NO cap)
-            if (token) {
-                this.log('Using Official Spotify Web API with full pagination...', 'info');
-                try {
-                    // Fetch playlist details
-                    const metaRes = await this.api.fetch(`https://api.spotify.com/v1/playlists/${playlistId}?fields=name,description,images,owner,tracks.total`, {
-                        headers: { 'Authorization': `Bearer ${token}` }
-                    });
-                    if (!metaRes.ok) throw new Error(`Spotify Playlist API returned ${metaRes.status}`);
-                    const meta = await metaRes.json();
-
-                    const playlistTitle = meta.name || 'Spotify Playlist';
-                    const playlistCover = meta.images?.[0]?.url || null;
-                    const totalTracks = meta.tracks?.total || 0;
-                    let allTracks = [];
-                    let offset = 0;
-                    const limit = 100;
-
-                    this.log(`Playlist "${playlistTitle}" has ${totalTracks} tracks. Fetching all pages...`, 'info');
-
-                    while (offset < totalTracks) {
-                        const pageRes = await this.api.fetch(
-                            `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=${limit}&offset=${offset}&fields=items(track(name,artists(name),album(name,images),duration_ms,external_ids,external_urls))`,
-                            { headers: { 'Authorization': `Bearer ${token}` } }
-                        );
-
-                        if (!pageRes.ok) throw new Error(`Page fetch failed at offset ${offset}`);
-                        const pageData = await pageRes.json();
-                        const items = pageData.items || [];
-                        if (items.length === 0) break;
-
-                        for (const item of items) {
-                            const t = item.track;
-                            if (!t || !t.name) continue;
-                            allTracks.push({
-                                title: t.name,
-                                artist: t.artists ? t.artists.map(a => a.name).join(', ') : 'Unknown',
-                                album: t.album?.name || '',
-                                duration_ms: t.duration_ms || 0,
-                                cover_url: t.album?.images?.[0]?.url || null,
-                                isrc: t.external_ids?.isrc || null
-                            });
-                        }
-
-                        this.log(`Loaded ${allTracks.length}/${totalTracks} tracks...`, 'info');
-                        this.updateFetchStatus(`Fetching: ${allTracks.length}/${totalTracks} tracks`);
-                        offset += limit;
-                    }
-
-                    this.log(`Successfully fetched ALL ${allTracks.length} tracks without cutoff!`, 'success');
-                    return {
-                        title: playlistTitle,
-                        image: playlistCover,
-                        total: allTracks.length,
-                        tracks: allTracks
-                    };
-                } catch (err) {
-                    this.log(`Official API error: ${err.message}. Falling back to public service...`, 'warn');
-                }
-            }
-
-            // Option B: Public Service (Fallback with pagination retry)
-            this.log('Using Public Multi-Page Service (Tip: Add your free Spotify API keys in Settings for 500+ track guarantee)', 'info');
-            const limit = 100;
-            let offset = 0, allTracks = [], playlistMeta = null, total = 0, page = 1;
-
-            while (true) {
-                const url = `${this.PUBLIC_PLAYLIST_API}/${playlistId}?limit=${limit}&offset=${offset}`;
-                const response = await this.api.fetch(url);
-                if (!response.ok) throw new Error(`API error: ${response.status}`);
-                const json = await response.json();
-                if (!json.success || !json.data) throw new Error('Invalid response from public API');
-                const data = json.data;
-
-                if (!playlistMeta) {
-                    playlistMeta = {
-                        title: data.name || 'Spotify Import',
-                        description: data.description || '',
-                        image: data.image || null,
-                        owner: data.owner || null
-                    };
-                    total = data.total || 0;
-                }
-
-                const pageTracks = (data.tracks || []).map(t => ({
-                    title: t.name,
-                    artist: Array.isArray(t.artists) ? t.artists.join(', ') : (t.artist || 'Unknown'),
-                    album: t.album || '',
-                    duration_ms: t.duration_ms || 0,
-                    cover_url: t.image || null,
-                    isrc: null
-                }));
-
-                allTracks = allTracks.concat(pageTracks);
-                this.log(`Page ${page}: ${pageTracks.length} tracks loaded (${allTracks.length}/${total})`, 'info');
-                this.updateFetchStatus(`Loaded ${allTracks.length} of ${total} tracks`);
-
-                if (!data.next || pageTracks.length === 0 || allTracks.length >= total) {
-                    if (allTracks.length < total) {
-                        this.log(`Public proxy stopped at ${allTracks.length} of ${total}. Set your free Spotify Developer keys in Settings tab to bypass public limits!`, 'warn');
-                    }
-                    break;
-                }
-                offset += limit;
-                page++;
-            }
-
-            return { ...playlistMeta, total: allTracks.length, tracks: allTracks };
-        },
-
-        // 3. Fetch Album
-        async fetchAlbum(albumId) {
-            this.log(`Fetching album (ID: ${albumId})...`, 'info');
-            const token = await this.getSpotifyToken();
-
-            if (token) {
-                const res = await this.api.fetch(`https://api.spotify.com/v1/albums/${albumId}`, {
-                    headers: { 'Authorization': `Bearer ${token}` }
-                });
-                if (res.ok) {
-                    const album = await res.json();
-                    const tracks = (album.tracks?.items || []).map(t => ({
-                        title: t.name,
-                        artist: t.artists ? t.artists.map(a => a.name).join(', ') : album.artists?.[0]?.name,
-                        album: album.name,
-                        duration_ms: t.duration_ms,
-                        cover_url: album.images?.[0]?.url || null,
-                        isrc: null
-                    }));
-
-                    return {
-                        title: `${album.name} - ${album.artists?.[0]?.name || ''}`,
-                        image: album.images?.[0]?.url || null,
-                        total: tracks.length,
-                        tracks: tracks
-                    };
-                }
-            }
-
-            throw new Error('Please enter Spotify API keys in Settings tab to import full albums.');
-        },
-
-        // ── Audion Source Search & Matching ──────────────────────────
-
-        searchAllSources(track, signal) {
+        querySearch(queryObj, signal) {
             return new Promise((resolve, reject) => {
-                if (signal?.aborted) {
-                    reject(new DOMException('Aborted', 'AbortError'));
-                    return;
-                }
+                if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
                 const results = [];
-                if (!this.api?.search?.query) {
-                    resolve([]);
-                    return;
-                }
+                if (!this.api?.search?.query) { resolve([]); return; }
 
                 this.api.search.query(
-                    {
-                        title: track.title,
-                        artist: track.artist,
-                        isrc: track.isrc,
-                        duration_ms: track.duration_ms
-                    },
+                    queryObj,
                     (result) => {
-                        if (signal?.aborted) {
-                            reject(new DOMException('Aborted', 'AbortError'));
-                            return;
-                        }
+                        if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
                         results.push(result);
                     },
                     () => {
-                        if (signal?.aborted) {
-                            reject(new DOMException('Aborted', 'AbortError'));
-                            return;
-                        }
+                        if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
                         resolve(results);
                     }
                 );
             });
         },
 
+        cleanSongTitle(title) {
+            if (!title) return '';
+            return title
+                .replace(/\s*[\(\[\{](?:female|male|duet|slowed|reverb|official|video|lyric|audio|from|feat|ft)[\s\S]*?[\)\]\}]/gi, '')
+                .replace(/\s*-\s*(?:female|male|duet|slowed|reverb|from|feat|ft)[\s\S]*$/gi, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+        },
+
+        cleanArtistName(artist) {
+            if (!artist) return '';
+            // If multiple artists, take the primary one for search
+            return artist.split(/[,&/]|feat\.|ft\./i)[0].trim();
+        },
+
         pickBestResult(results) {
             const SOURCE_PRIORITY = ['qobuz', 'jiosaavn', 'universal', 'tidal'];
             const successes = results.filter(r => r.status === 'success');
             if (successes.length === 0) return null;
-
             for (const sourceId of SOURCE_PRIORITY) {
-                const fromSource = successes
-                    .filter(r => r.sourceId === sourceId)
-                    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+                const fromSource = successes.filter(r => r.sourceId === sourceId).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
                 if (fromSource.length > 0) return fromSource[0];
             }
+            return successes[0];
+        },
 
-            return successes.sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0] || null;
+        normalizeString(str) {
+            if (!str) return '';
+            return str.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
         },
 
         async getLibraryIndex() {
@@ -436,14 +123,10 @@
                     const tracks = await this.api.library.getTracks();
                     if (Array.isArray(tracks)) {
                         tracks.forEach(t => {
-                            if (t.source_type && t.external_id) {
-                                map.set(`${t.source_type}:${t.external_id}`, t.id);
-                            }
+                            if (t.source_type && t.external_id) map.set(`${t.source_type}:${t.external_id}`, t.id);
                         });
                     }
-                } catch (e) {
-                    console.error(e);
-                }
+                } catch (e) { console.error(e); }
             }
             return map;
         },
@@ -461,848 +144,1096 @@
                 bitrate: result.bitrate || null,
                 track_number: result.track_number || null,
                 disc_number: result.disc_number || null,
-                metadata_json: result.metadata_json || null
+                musicbrainz_recording_id: result.musicbrainz_recording_id || null,
+                metadata_json: result.metadata_json || null,
             });
         },
 
-        // ── Single Track Destination Modal ───────────────────────────
+        // ── Styles (Matching Spotify Converter) ─────────────────────────────
+        injectStyles() {
+            if (document.getElementById('sc2-styles')) return;
+            const s = document.createElement('style');
+            s.id = 'sc2-styles';
+            s.textContent = `
+                #sc2-overlay {
+                    position: fixed; inset: 0;
+                    background: rgba(0,0,0,0.75);
+                    backdrop-filter: blur(8px);
+                    z-index: 10000; opacity: 0; visibility: hidden;
+                    transition: opacity 0.2s;
+                }
+                #sc2-overlay.open { opacity: 1; visibility: visible; }
 
-        async openSingleTrackPrompt(track) {
-            this.pendingTrackData = track;
+                #sc2-modal {
+                    position: fixed; top: 50%; left: 50%;
+                    transform: translate(-50%, -50%) scale(0.96);
+                    width: 720px; max-width: 96vw; max-height: 90vh;
+                    background: #0d0d0d;
+                    border: 0.5px solid rgba(255,255,255,0.08);
+                    border-radius: 24px;
+                    z-index: 10001;
+                    display: flex; flex-direction: column;
+                    overflow: hidden;
+                    opacity: 0; visibility: hidden;
+                    transition: all 0.3s cubic-bezier(0.16,1,0.3,1);
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                }
+                #sc2-modal.open {
+                    opacity: 1; visibility: visible;
+                    transform: translate(-50%, -50%) scale(1);
+                }
 
-            // Load all current Audion playlists
+                .sc2-topbar {
+                    display: flex; align-items: center; justify-content: space-between;
+                    padding: 13px 18px;
+                    border-bottom: 0.5px solid rgba(255,255,255,0.07);
+                    background: #0d0d0d; flex-shrink: 0;
+                }
+                .sc2-topbar-left { display: flex; align-items: center; gap: 10px; }
+                .sc2-logo { color: #1DB954; display: flex; }
+                .sc2-title { font-size: 14px; font-weight: 500; color: #fff; letter-spacing: -0.2px; }
+                .sc2-dot { width: 3px; height: 3px; border-radius: 50%; background: #444; }
+                .sc2-sub { font-size: 12px; color: #777; }
+                .sc2-chip {
+                    font-size: 10px; font-weight: 500; color: #1DB954;
+                    background: rgba(29,185,84,0.10); border: 0.5px solid rgba(29,185,84,0.22);
+                    padding: 3px 9px; border-radius: 20px; letter-spacing: 0.3px;
+                }
+                .sc2-icon-btn {
+                    width: 30px; height: 30px; border-radius: 50%;
+                    background: transparent; border: 0.5px solid rgba(255,255,255,0.10);
+                    color: #777; cursor: pointer;
+                    display: flex; align-items: center; justify-content: center;
+                    font-size: 14px; transition: background .15s, color .15s;
+                }
+                .sc2-icon-btn:hover { background: #222; color: #fff; }
+
+                .sc2-two-col {
+                    display: grid; grid-template-columns: 1.15fr 1fr;
+                    flex: 1; min-height: 0; overflow: hidden;
+                }
+
+                /* Left panel */
+                .sc2-left {
+                    border-right: 0.5px solid rgba(255,255,255,0.07);
+                    display: flex; flex-direction: column;
+                    padding: 16px; gap: 12px;
+                    overflow-y: auto; background: #0d0d0d;
+                }
+                .sc2-left::-webkit-scrollbar { width: 3px; }
+                .sc2-left::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+                .sc2-plabel {
+                    font-size: 10px; font-weight: 500; letter-spacing: 0.7px;
+                    text-transform: uppercase; color: #555; margin-bottom: 8px;
+                    display: flex; align-items: center; gap: 5px;
+                }
+
+                .sc2-url-card {
+                    background: #141414; border: 0.5px solid rgba(255,255,255,0.08);
+                    border-radius: 14px; padding: 13px;
+                }
+                .sc2-field-wrap { position: relative; margin-bottom: 10px; }
+                .sc2-field {
+                    width: 100%; height: 40px;
+                    background: #1e1e1e; border: 0.5px solid rgba(255,255,255,0.10);
+                    color: #fff; padding: 0 38px 0 12px;
+                    border-radius: 10px; font-size: 13px;
+                    outline: none; transition: border-color .15s; box-sizing: border-box;
+                }
+                .sc2-field::placeholder { color: #555; }
+                .sc2-field:focus { border-color: #1DB954; background: #222; }
+                .sc2-field:disabled { opacity: 0.4; pointer-events: none; }
+                .sc2-field-x {
+                    position: absolute; right: 10px; top: 50%;
+                    transform: translateY(-50%);
+                    width: 20px; height: 20px; border-radius: 50%;
+                    background: #2a2a2a; border: none; color: #aaa;
+                    font-size: 11px; cursor: pointer;
+                    display: none; align-items: center; justify-content: center;
+                }
+                .sc2-field-x:hover { background: #444; }
+
+                .sc2-sep { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+                .sc2-sep-line { flex: 1; height: 0.5px; background: rgba(255,255,255,0.06); }
+                .sc2-sep-text { font-size: 11px; color: #444; }
+
+                .sc2-json-btn {
+                    width: 100%; height: 38px;
+                    background: transparent; border: 0.5px solid rgba(255,255,255,0.11);
+                    border-radius: 10px; color: #999; font-size: 13px; cursor: pointer;
+                    display: flex; align-items: center; justify-content: center; gap: 8px;
+                    transition: border-color .15s, color .15s, background .15s;
+                    box-sizing: border-box;
+                }
+                .sc2-json-btn:hover { border-color: rgba(29,185,84,0.45); color: #fff; background: rgba(29,185,84,0.08); }
+
+                .sc2-file-pill {
+                    display: none; align-items: center; gap: 8px;
+                    background: rgba(29,185,84,0.09);
+                    border: 0.5px solid rgba(29,185,84,0.22);
+                    border-radius: 8px; padding: 8px 10px; margin-top: 8px;
+                }
+                .sc2-pill-text { font-size: 12px; color: #1DB954; flex: 1; }
+                .sc2-pill-remove {
+                    background: transparent; border: none;
+                    color: rgba(29,185,84,0.5); cursor: pointer;
+                    font-size: 14px; padding: 2px;
+                }
+                .sc2-pill-remove:hover { color: #e85555; }
+
+                .sc2-notice {
+                    background: rgba(29,185,84,0.06);
+                    border: 0.5px solid rgba(29,185,84,0.18);
+                    border-radius: 10px; padding: 10px 12px;
+                    font-size: 12px; color: #a0a0a0; line-height: 1.5;
+                }
+                .sc2-notice strong { color: #1DB954; font-weight: 500; }
+
+                .sc2-preview {
+                    background: #141414; border: 0.5px solid rgba(255,255,255,0.08);
+                    border-radius: 14px; padding: 13px;
+                    display: none; align-items: center; gap: 12px;
+                }
+                .sc2-prev-art {
+                    width: 54px; height: 54px; border-radius: 10px;
+                    background: #1e1e1e; flex-shrink: 0;
+                    display: flex; align-items: center; justify-content: center;
+                    color: #444; font-size: 20px; overflow: hidden;
+                }
+                .sc2-prev-art img { width: 100%; height: 100%; object-fit: cover; border-radius: 9px; }
+                .sc2-prev-info { flex: 1; overflow: hidden; }
+                .sc2-prev-name {
+                    font-size: 14px; font-weight: 500; color: #fff;
+                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 2px;
+                }
+                .sc2-prev-owner, .sc2-prev-count {
+                    font-size: 11px; color: #777;
+                    display: flex; align-items: center; gap: 4px; margin-bottom: 2px;
+                }
+                .sc2-prev-badge {
+                    font-size: 10px; font-weight: 600; padding: 3px 7px; border-radius: 4px;
+                    background: rgba(29,185,84,0.12); color: #1DB954; border: 0.5px solid rgba(29,185,84,0.25);
+                }
+
+                /* Single Track Destination Card */
+                .sc2-dest-card {
+                    display: none; background: #141414; border: 0.5px solid rgba(29,185,84,0.25);
+                    border-radius: 14px; padding: 12px 14px; flex-direction: column; gap: 8px;
+                }
+                .sc2-dest-card.open { display: flex; }
+                .sc2-dest-title { font-size: 11px; font-weight: 600; text-transform: uppercase; color: #1DB954; letter-spacing: 0.5px; }
+                .sc2-radio-row {
+                    display: flex; align-items: center; gap: 8px; font-size: 12px; color: #ccc; cursor: pointer;
+                }
+                .sc2-dest-select, .sc2-dest-input {
+                    margin-left: 20px; width: calc(100% - 20px); height: 32px;
+                    background: #1c1c1c; border: 0.5px solid #333; border-radius: 6px;
+                    color: #fff; padding: 0 8px; font-size: 12px; box-sizing: border-box;
+                }
+
+                .sc2-actions { margin-top: auto; display: flex; gap: 8px; padding-top: 8px; }
+                .sc2-btn-stop {
+                    height: 40px; padding: 0 16px; border-radius: 10px;
+                    background: transparent; border: 0.5px solid rgba(255,255,255,0.11);
+                    color: #888; font-size: 13px; font-weight: 500; cursor: pointer;
+                    display: flex; align-items: center; gap: 6px; transition: all .15s;
+                }
+                .sc2-btn-stop:hover:not(:disabled) { background: #1e1e1e; color: #fff; }
+                .sc2-btn-stop:disabled { opacity: 0.3; cursor: not-allowed; }
+                .sc2-btn-convert {
+                    flex: 1; height: 40px; border-radius: 10px;
+                    background: #1DB954; border: none; color: #000;
+                    font-size: 13px; font-weight: 600; cursor: pointer;
+                    display: flex; align-items: center; justify-content: center; gap: 7px;
+                    transition: filter .15s, transform .1s; letter-spacing: -0.1px;
+                }
+                .sc2-btn-convert:hover:not(:disabled) { filter: brightness(1.10); }
+                .sc2-btn-convert:active:not(:disabled) { transform: scale(0.98); }
+                .sc2-btn-convert:disabled { opacity: 0.4; cursor: not-allowed; }
+
+                /* Right panel */
+                .sc2-right {
+                    display: flex; flex-direction: column; background: #0d0d0d; overflow: hidden;
+                }
+                .sc2-right-hdr {
+                    padding: 14px 16px 10px;
+                    border-bottom: 0.5px solid rgba(255,255,255,0.07); flex-shrink: 0;
+                }
+                .sc2-prog-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+                .sc2-prog-track {
+                    flex: 1; height: 3px; background: rgba(255,255,255,0.07);
+                    border-radius: 2px; overflow: hidden;
+                }
+                .sc2-prog-fill {
+                    height: 100%; width: 0%; background: #1DB954;
+                    border-radius: 2px; transition: width .25s ease;
+                }
+                .sc2-prog-pct {
+                    font-size: 11px; color: #666; min-width: 32px;
+                    text-align: right; font-variant-numeric: tabular-nums;
+                }
+
+                .sc2-stats {
+                    display: grid; grid-template-columns: repeat(3, 1fr);
+                    gap: 8px; padding: 12px 16px 0; flex-shrink: 0;
+                }
+                .sc2-stat {
+                    background: #141414; border: 0.5px solid rgba(255,255,255,0.07);
+                    border-radius: 10px; padding: 10px 12px; text-align: center;
+                }
+                .sc2-stat-val {
+                    font-size: 20px; font-weight: 500; line-height: 1;
+                    color: #fff; font-variant-numeric: tabular-nums;
+                }
+                .sc2-stat-val.green { color: #1DB954; }
+                .sc2-stat-val.amber { color: #f59e0b; }
+                .sc2-stat-val.red { color: #e85555; }
+                .sc2-stat-lbl {
+                    font-size: 10px; color: #555; margin-top: 4px;
+                    text-transform: uppercase; letter-spacing: 0.5px;
+                }
+
+                .sc2-log-wrap {
+                    flex: 1; overflow-y: auto; padding: 12px 16px; min-height: 0;
+                }
+                .sc2-log-wrap::-webkit-scrollbar { width: 3px; }
+                .sc2-log-wrap::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+                .sc2-log-line {
+                    display: flex; align-items: baseline; gap: 7px;
+                    padding: 2px 0; font-size: 11.5px; line-height: 1.6;
+                    font-family: 'Courier New', monospace;
+                }
+                .sc2-log-arrow { color: #444; flex-shrink: 0; font-size: 10px; }
+                .sc2-log-msg { color: #777; }
+                .sc2-log-line.success .sc2-log-msg { color: #1DB954; }
+                .sc2-log-line.error   .sc2-log-msg { color: #e85555; }
+                .sc2-log-line.warn    .sc2-log-msg { color: #f59e0b; }
+                .sc2-log-line.info    .sc2-log-msg { color: #bbb; }
+                .sc2-log-line.divider .sc2-log-msg { color: #2a2a2a; letter-spacing: 1px; }
+
+                .sc2-status-bar {
+                    padding: 10px 16px 14px;
+                    border-top: 0.5px solid rgba(255,255,255,0.07);
+                    display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+                }
+                .sc2-status-dot {
+                    width: 6px; height: 6px; border-radius: 50%;
+                    background: #333; flex-shrink: 0; transition: background .3s;
+                }
+                .sc2-status-dot.active { background: #1DB954; }
+                .sc2-status-dot.done   { background: #1DB954; }
+                .sc2-status-dot.err    { background: #e85555; }
+                .sc2-status-txt { font-size: 11px; color: #555; flex: 1; }
+            `;
+            document.head.appendChild(s);
+        },
+
+        // ── Modal Creation ──────────────────────────────────────────────────
+        createModal() {
+            const overlay = document.createElement('div');
+            overlay.id = 'sc2-overlay';
+            overlay.onclick = () => { if (!this.isConverting) this.close(); };
+            document.body.appendChild(overlay);
+
+            const modal = document.createElement('div');
+            modal.id = 'sc2-modal';
+            modal.innerHTML = `
+                <div class="sc2-topbar">
+                    <div class="sc2-topbar-left">
+                        <span class="sc2-logo" aria-hidden="true">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141 4.32-1.38 9.841-.719 13.44 1.56.42.3.6.84.3 1.26zm.12-3.36C14.939 8.46 8.641 8.28 5.1 9.421c-.6.18-1.26-.12-1.441-.72-.18-.6.12-1.26.72-1.44 4.08-1.26 11.04-1.02 15.361 1.56.6.358.779 1.14.421 1.74-.359.6-1.14.779-1.741.419z"/></svg>
+                        </span>
+                        <span class="sc2-title">Spotify to Audion</span>
+                        <span class="sc2-dot" aria-hidden="true"></span>
+                        <span class="sc2-sub">Universal Importer</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px">
+                        <span class="sc2-chip">Unlimited</span>
+                        <button class="sc2-icon-btn" id="sc2-close" aria-label="Close">✕</button>
+                    </div>
+                </div>
+
+                <div class="sc2-two-col">
+                    <div class="sc2-left">
+                        <div>
+                            <div class="sc2-plabel">Source</div>
+                            <div class="sc2-url-card">
+                                <div class="sc2-field-wrap">
+                                    <input type="text" id="sc2-url" class="sc2-field" placeholder="Paste Spotify Playlist, Album, or Track URL..." autocomplete="off">
+                                    <button class="sc2-field-x" id="sc2-field-x" aria-label="Clear">✕</button>
+                                </div>
+                                <div class="sc2-sep">
+                                    <div class="sc2-sep-line"></div>
+                                    <span class="sc2-sep-text">or</span>
+                                    <div class="sc2-sep-line"></div>
+                                </div>
+                                <label for="sc2-file" class="sc2-json-btn" id="sc2-json-label">Upload JSON backup</label>
+                                <input type="file" id="sc2-file" accept=".json" style="display:none">
+                                <div class="sc2-file-pill" id="sc2-pill">
+                                    <span class="sc2-pill-text" id="sc2-pill-text"></span>
+                                    <button class="sc2-pill-remove" id="sc2-pill-remove" aria-label="Remove file">✕</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="sc2-notice">
+                            Supports <strong>entire playlists</strong> (500+ tracks), <strong>albums</strong>, and <strong>single songs</strong>. Matches via <strong>saavan-search</strong> or <strong>qobuz-player</strong>.
+                        </div>
+
+                        <!-- Preview Card -->
+                        <div class="sc2-preview" id="sc2-preview">
+                            <div class="sc2-prev-art" id="sc2-prev-art"></div>
+                            <div class="sc2-prev-info">
+                                <div class="sc2-prev-name" id="sc2-prev-name">—</div>
+                                <div class="sc2-prev-owner" id="sc2-prev-owner" style="display:none">
+                                    <span id="sc2-prev-owner-text"></span>
+                                </div>
+                                <div class="sc2-prev-count">
+                                    <span id="sc2-prev-count"></span>
+                                </div>
+                            </div>
+                            <div class="sc2-prev-badge" id="sc2-prev-badge">PLAYLIST</div>
+                        </div>
+
+                        <!-- Single Track Destination Selector -->
+                        <div class="sc2-dest-card" id="sc2-dest-card">
+                            <div class="sc2-dest-title">Where to save this song?</div>
+                            <label class="sc2-radio-row">
+                                <input type="radio" name="sc2-dest" value="library" checked>
+                                <span>Save directly to Main Library</span>
+                            </label>
+                            <label class="sc2-radio-row">
+                                <input type="radio" name="sc2-dest" value="existing_playlist">
+                                <span>Add to Playlist:</span>
+                            </label>
+                            <select id="sc2-dest-select" class="sc2-dest-select"></select>
+
+                            <label class="sc2-radio-row">
+                                <input type="radio" name="sc2-dest" value="new_playlist">
+                                <span>Create New Playlist:</span>
+                            </label>
+                            <input type="text" id="sc2-dest-new-name" class="sc2-dest-input" placeholder="e.g. My Favorites">
+                        </div>
+
+                        <div class="sc2-actions">
+                            <button class="sc2-btn-stop" id="sc2-stop" disabled>Stop</button>
+                            <button class="sc2-btn-convert" id="sc2-convert">Convert</button>
+                        </div>
+                    </div>
+
+                    <div class="sc2-right">
+                        <div class="sc2-right-hdr">
+                            <div class="sc2-plabel" style="margin-bottom:0">Activity log</div>
+                            <div class="sc2-prog-row">
+                                <div class="sc2-prog-track">
+                                    <div class="sc2-prog-fill" id="sc2-prog-fill"></div>
+                                </div>
+                                <span class="sc2-prog-pct" id="sc2-prog-pct">0%</span>
+                            </div>
+                        </div>
+
+                        <div class="sc2-stats">
+                            <div class="sc2-stat">
+                                <div class="sc2-stat-val green" id="sc2-stat-new">—</div>
+                                <div class="sc2-stat-lbl">Added</div>
+                            </div>
+                            <div class="sc2-stat">
+                                <div class="sc2-stat-val amber" id="sc2-stat-lib">—</div>
+                                <div class="sc2-stat-lbl">Library</div>
+                            </div>
+                            <div class="sc2-stat">
+                                <div class="sc2-stat-val red" id="sc2-stat-miss">—</div>
+                                <div class="sc2-stat-lbl">Not found</div>
+                            </div>
+                        </div>
+
+                        <div class="sc2-log-wrap" id="sc2-log">
+                            <div class="sc2-log-line info">
+                                <span class="sc2-log-arrow">›</span>
+                                <span class="sc2-log-msg">Ready. Paste a Spotify URL (playlist, album, or track) or upload a JSON backup.</span>
+                            </div>
+                        </div>
+
+                        <div class="sc2-status-bar">
+                            <div class="sc2-status-dot" id="sc2-status-dot"></div>
+                            <span class="sc2-status-txt" id="sc2-status-txt">Idle</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+
+            modal.querySelector('#sc2-close').onclick = () => this.close();
+            modal.querySelector('#sc2-convert').onclick = () => this.startImportProcess();
+            modal.querySelector('#sc2-stop').onclick = () => this.stopConversionProcess();
+            modal.querySelector('#sc2-file').addEventListener('change', e => this.handleFileUpload(e));
+            modal.querySelector('#sc2-pill-remove').onclick = () => this.clearFile();
+
+            modal.querySelector('#sc2-field-x').addEventListener('click', () => {
+                modal.querySelector('#sc2-url').value = '';
+                modal.querySelector('#sc2-field-x').style.display = 'none';
+                modal.querySelector('#sc2-preview').style.display = 'none';
+                modal.querySelector('#sc2-dest-card').classList.remove('open');
+                this.singleTrackData = null;
+                this.detectedType = null;
+                modal.querySelector('#sc2-url').focus();
+            });
+
+            // Instant auto-detection on URL paste or enter
+            const urlInput = modal.querySelector('#sc2-url');
+            urlInput.addEventListener('input', () => {
+                const v = urlInput.value.trim();
+                modal.querySelector('#sc2-field-x').style.display = v ? 'flex' : 'none';
+                if (v.includes('spotify.com/') || v.startsWith('spotify:')) {
+                    this.onUrlEntered(v);
+                }
+            });
+            urlInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    const v = urlInput.value.trim();
+                    if (v) this.onUrlEntered(v);
+                }
+            });
+        },
+
+        createMenuButton() {
+            const btn = document.createElement('button');
+            btn.className = 'plugin-menu-btn';
+            btn.innerHTML = `
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M2 12h20M2 12l5-5m-5 5l5 5"/><circle cx="12" cy="12" r="10"/>
+                </svg>
+                <span>Spotify Universal Importer</span>
+            `;
+            btn.onclick = () => this.open();
+            this.api.ui.registerSlot('playerbar:menu', btn);
+        },
+
+        async open() {
+            this.isOpen = true;
+            document.getElementById('sc2-overlay')?.classList.add('open');
+            document.getElementById('sc2-modal')?.classList.add('open');
+            // Refresh playlists for destination picker
             try {
                 this.cachedPlaylists = (await this.api.library.getPlaylists()) || [];
-            } catch (err) {
+            } catch (e) {
                 this.cachedPlaylists = [];
             }
+        },
 
-            const promptModal = document.getElementById('sui-single-prompt');
-            const previewImg = document.getElementById('sui-st-cover');
-            const previewTitle = document.getElementById('sui-st-title');
-            const previewArtist = document.getElementById('sui-st-artist');
-            const playlistSelect = document.getElementById('sui-st-playlist-select');
+        close() {
+            if (this.isConverting) return;
+            this.isOpen = false;
+            document.getElementById('sc2-overlay')?.classList.remove('open');
+            document.getElementById('sc2-modal')?.classList.remove('open');
+        },
 
-            if (previewImg) previewImg.src = track.cover_url || 'https://via.placeholder.com/100';
-            if (previewTitle) previewTitle.textContent = track.title;
-            if (previewArtist) previewArtist.textContent = `${track.artist} ${track.album ? '• ' + track.album : ''}`;
+        // ── URL Detection & Preview ─────────────────────────────────────────
+        async onUrlEntered(rawUrl) {
+            const str = rawUrl.trim();
+            const trackMatch = str.match(/(?:track\/|track:)([a-zA-Z0-9]+)/);
+            const playlistMatch = str.match(/(?:playlist\/|playlist:)([a-zA-Z0-9]+)/);
+            const albumMatch = str.match(/(?:album\/|album:)([a-zA-Z0-9]+)/);
 
-            // Populate existing playlists dropdown
-            if (playlistSelect) {
-                playlistSelect.innerHTML = '';
-                if (this.cachedPlaylists.length === 0) {
-                    playlistSelect.innerHTML = '<option value="">(No playlists found)</option>';
-                } else {
-                    this.cachedPlaylists.forEach(pl => {
-                        const opt = document.createElement('option');
-                        opt.value = pl.id;
-                        opt.textContent = pl.name || pl.title || `Playlist #${pl.id}`;
-                        playlistSelect.appendChild(opt);
-                    });
-                }
+            if (trackMatch) {
+                this.detectedType = 'track';
+                this.fetchAndPreviewSingleTrack(trackMatch[1], str);
+            } else if (playlistMatch) {
+                this.detectedType = 'playlist';
+                document.getElementById('sc2-dest-card')?.classList.remove('open');
+                document.getElementById('sc2-convert').textContent = 'Convert playlist';
+                this.fetchAndPreviewPlaylist(playlistMatch[1]);
+            } else if (albumMatch) {
+                this.detectedType = 'album';
+                document.getElementById('sc2-dest-card')?.classList.remove('open');
+                document.getElementById('sc2-convert').textContent = 'Convert album';
+                this.fetchAndPreviewAlbum(albumMatch[1]);
             }
-
-            if (promptModal) promptModal.classList.remove('hidden');
         },
 
-        closeSingleTrackPrompt() {
-            const promptModal = document.getElementById('sui-single-prompt');
-            if (promptModal) promptModal.classList.add('hidden');
-            this.pendingTrackData = null;
-        },
-
-        async executeSingleTrackSave(destination, extraData = {}) {
-            const track = this.pendingTrackData;
-            if (!track) return;
-
-            this.closeSingleTrackPrompt();
-            this.log(`Resolving stream source for: "${track.title}" - ${track.artist}...`, 'info');
-            this.setStatus('Searching source...', 'active');
+        // ── Single Track Handling ───────────────────────────────────────────
+        async fetchAndPreviewSingleTrack(trackId, rawUrl) {
+            this.log(`Loading Spotify track (ID: ${trackId})…`, 'info');
+            this.setStatus('Loading track…', 'active');
 
             try {
-                // 1. Search Audion sources for the audio stream
+                let track = null;
+
+                // 1. Fetch via Spotify embed HTML (has exact __NEXT_DATA__ entity with true title and artist)
+                try {
+                    const embedRes = await this.api.fetch(`https://open.spotify.com/embed/track/${trackId}`);
+                    if (embedRes.ok) {
+                        const html = await embedRes.text();
+                        const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+                        if (nextDataMatch) {
+                            const nextData = JSON.parse(nextDataMatch[1]);
+                            const entity = nextData.props?.pageProps?.state?.data?.entity;
+                            if (entity) {
+                                track = {
+                                    title: entity.title || entity.name,
+                                    artist: (entity.artists || []).map(a => a.name).join(', ') || 'Unknown Artist',
+                                    album: '',
+                                    duration_ms: entity.duration || 180000,
+                                    cover_url: entity.visualIdentity?.image?.[0]?.url || null,
+                                    isrc: null
+                                };
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn('[SpotifyImporter] Embed parser fallback:', e);
+                }
+
+                // 2. Fallback to oEmbed if needed
+                if (!track) {
+                    const oembedUrl = `https://open.spotify.com/oembed?url=${encodeURIComponent(`https://open.spotify.com/track/${trackId}`)}`;
+                    const oembedRes = await this.api.fetch(oembedUrl);
+                    if (oembedRes.ok) {
+                        const data = await oembedRes.json();
+                        let title = data.title || 'Track';
+                        let artist = '';
+                        if (title.includes(' by ')) {
+                            const p = title.split(' by ');
+                            title = p[0].trim();
+                            artist = p[1].trim();
+                        }
+                        track = {
+                            title: title,
+                            artist: artist,
+                            album: '',
+                            duration_ms: 180000,
+                            cover_url: data.thumbnail_url || null,
+                            isrc: null
+                        };
+                    }
+                }
+
+                if (!track) throw new Error('Could not fetch Spotify track info.');
+
+                this.singleTrackData = track;
+
+                // Show Preview Card
+                const art = document.getElementById('sc2-prev-art');
+                if (track.cover_url) {
+                    art.innerHTML = `<img src="${track.cover_url}" alt="">`;
+                } else {
+                    art.innerHTML = `<span style="font-size:20px">🎵</span>`;
+                }
+                document.getElementById('sc2-prev-name').textContent = track.title;
+                document.getElementById('sc2-prev-owner').style.display = 'flex';
+                document.getElementById('sc2-prev-owner-text').textContent = track.artist || 'Single Track';
+                document.getElementById('sc2-prev-count').textContent = 'Single Track';
+                document.getElementById('sc2-prev-badge').textContent = 'TRACK';
+                document.getElementById('sc2-preview').style.display = 'flex';
+
+                // Populate and show destination card
+                const destCard = document.getElementById('sc2-dest-card');
+                const selectEl = document.getElementById('sc2-dest-select');
+                if (selectEl) {
+                    selectEl.innerHTML = '';
+                    if (this.cachedPlaylists.length === 0) {
+                        selectEl.innerHTML = '<option value="">(No existing playlists)</option>';
+                    } else {
+                        this.cachedPlaylists.forEach(pl => {
+                            const opt = document.createElement('option');
+                            opt.value = pl.id;
+                            opt.textContent = pl.name || pl.title || `Playlist #${pl.id}`;
+                            selectEl.appendChild(opt);
+                        });
+                    }
+                }
+                destCard.classList.add('open');
+                document.getElementById('sc2-convert').textContent = 'Save track';
+
+                this.log(`Track: "${track.title}" by ${track.artist}`, 'info');
+                this.setStatus('Ready to save', 'idle');
+            } catch (err) {
+                console.error(err);
+                this.log(`Failed to fetch track: ${err.message}`, 'error');
+                this.setStatus('Error', 'err');
+            }
+        },
+
+        async saveSingleTrack() {
+            const track = this.singleTrackData;
+            if (!track) return;
+
+            const convertBtn = document.getElementById('sc2-convert');
+            convertBtn.disabled = true;
+            this.setStatus('Searching stream…', 'active');
+            this.log(`━━━━━━━━━━━━━━━━━━━━━━━`, 'divider');
+            this.log(`Searching audio sources for: "${track.title}" - ${track.artist}`, 'info');
+
+            try {
                 const results = await this.searchAllSources(track, null);
                 const best = this.pickBestResult(results);
 
                 if (!best) {
-                    this.log(`Could not find an audio stream for "${track.title}" on configured sources.`, 'error');
-                    alert(`Could not find a streamable audio source for "${track.title}". Make sure you have JioSaavn or Qobuz plugin installed.`);
-                    this.setStatus('Ready', 'idle');
+                    this.log(`No match found on JioSaavn or Qobuz for "${track.title}".`, 'error');
+                    this.updateStats(0, 0, 1);
+                    this.setStatus('Not found', 'err');
+                    convertBtn.disabled = false;
                     return;
                 }
 
                 if (!best.cover_url && track.cover_url) best.cover_url = track.cover_url;
 
-                // 2. Add track to Audion library
-                const libraryTrackId = await this.addTrackToLibrary(best);
-                this.log(`Track added to library (ID: ${libraryTrackId})`, 'success');
+                // Add to Audion library
+                const libraryId = await this.addTrackToLibrary(best);
+                this.log(`Added to library: "${best.title}" (${best.source_type})`, 'success');
 
-                // 3. Handle user's selected destination
-                if (destination === 'library') {
-                    this.log(`Saved "${track.title}" directly to your Library!`, 'success');
-                    alert(`Saved "${track.title}" to Library!`);
-                } else if (destination === 'existing_playlist') {
-                    const plId = extraData.playlistId;
+                // Destination
+                const destVal = document.querySelector('input[name="sc2-dest"]:checked')?.value || 'library';
+                if (destVal === 'existing_playlist') {
+                    const plId = document.getElementById('sc2-dest-select')?.value;
                     if (plId) {
-                        await this.api.library.addTrackToPlaylist(plId, libraryTrackId);
-                        this.log(`Added "${track.title}" to selected playlist!`, 'success');
-                        alert(`Added "${track.title}" to playlist!`);
+                        await this.api.library.addTrackToPlaylist(plId, libraryId);
+                        this.log(`Added to selected playlist!`, 'success');
                     }
-                } else if (destination === 'new_playlist') {
-                    const plName = extraData.playlistName || `${track.title} Radio`;
-                    const newPlId = await this.api.library.createPlaylist(plName, track.cover_url);
-                    await this.api.library.addTrackToPlaylist(newPlId, libraryTrackId);
-                    this.log(`Created playlist "${plName}" and added track!`, 'success');
-                    alert(`Created playlist "${plName}" with "${track.title}"!`);
-                } else if (destination === 'download') {
-                    if (this.api?.library?.downloadTrack && best.url) {
-                        await this.api.library.downloadTrack({
-                            url: best.url,
-                            filename: `${track.artist} - ${track.title}.mp3`,
-                            metadata: { title: track.title, artist: track.artist, album: track.album }
-                        });
-                        this.log(`Download started for "${track.title}".`, 'success');
-                    } else {
-                        alert('Direct audio download is not supported for this source format.');
-                    }
+                } else if (destVal === 'new_playlist') {
+                    const newName = document.getElementById('sc2-dest-new-name')?.value?.trim() || `${track.title} Mix`;
+                    const newPlId = await this.api.library.createPlaylist(newName, track.cover_url);
+                    await this.api.library.addTrackToPlaylist(newPlId, libraryId);
+                    this.log(`Created playlist "${newName}" and added track!`, 'success');
                 }
 
-                // Optional: Play immediately if requested
-                if (extraData.playNow && this.api?.player) {
-                    this.api.player.setTrack({
-                        title: track.title,
-                        artist: track.artist,
-                        album: track.album,
-                        cover_url: track.cover_url,
-                        source_type: best.source_type,
-                        external_id: best.external_id
-                    });
-                    this.api.player.play?.();
-                }
-
-                this.setStatus('Success', 'ok');
+                this.updateStats(1, 0, 0);
+                this.updateProgress(100);
+                this.setStatus('Saved!', 'done');
+                this.log(`Track successfully imported!`, 'success');
             } catch (err) {
-                console.error('[SpotifyImporter] Single track save error:', err);
-                this.log(`Error: ${err.message}`, 'error');
-                this.setStatus('Error', 'err');
+                console.error(err);
+                this.log(`Error saving track: ${err.message}`, 'error');
+                this.setStatus('Failed', 'err');
+            } finally {
+                convertBtn.disabled = false;
             }
         },
 
-        // ── Multi-Track Batch Importer (Playlists & Albums) ───────────
-
-        async processBatchImport(data) {
-            this.isConverting = true;
-            this.stopRequested = false;
-            this.abortController = new AbortController();
-
-            const convertBtn = document.getElementById('sui-btn-convert');
-            const stopBtn = document.getElementById('sui-btn-stop');
-            if (convertBtn) convertBtn.disabled = true;
-            if (stopBtn) stopBtn.disabled = false;
-
-            this.updateProgress(0);
-            this.setStatus('Importing…', 'active');
-            this.log(`Starting import: ${data.tracks.length} tracks`, 'info');
+        // ── Playlist & Album Fetching (Unlimited Pagination) ────────────────
+        async fetchAndPreviewPlaylist(playlistId) {
+            this.log(`Loading playlist (ID: ${playlistId})…`, 'info');
+            this.setStatus('Loading playlist…', 'active');
 
             try {
-                // 1. Get index of existing library tracks to prevent duplicate adds
-                const existingTracks = await this.getLibraryIndex();
+                // First attempt: Check embed page for live accessToken
+                let token = null;
+                try {
+                    const embedRes = await this.api.fetch(`https://open.spotify.com/embed/playlist/${playlistId}`);
+                    if (embedRes.ok) {
+                        const html = await embedRes.text();
+                        const tokenMatch = html.match(/"accessToken":"([^"]+)"/);
+                        if (tokenMatch) token = tokenMatch[1];
+                    }
+                } catch (e) { }
 
-                // 2. Create the playlist in Audion
-                let audionPlaylistId = null;
-                if (this.api?.library?.createPlaylist) {
-                    audionPlaylistId = await this.api.library.createPlaylist(data.title, data.image);
-                    this.log(`Created Audion playlist: "${data.title}"`, 'success');
+                let playlistData = null;
+
+                // If token acquired from embed page, use official API with UNLIMITED pagination!
+                if (token) {
+                    this.log('Acquired Spotify session. Loading all pages with zero limits…', 'info');
+                    try {
+                        const metaRes = await this.api.fetch(`https://api.spotify.com/v1/playlists/${playlistId}?fields=name,description,images,owner,tracks.total`, {
+                            headers: { 'Authorization': `Bearer ${token}` }
+                        });
+                        if (metaRes.ok) {
+                            const meta = await metaRes.json();
+                            const total = meta.tracks?.total || 0;
+                            let allTracks = [];
+                            let offset = 0;
+                            const limit = 100;
+
+                            while (offset < total) {
+                                const pageRes = await this.api.fetch(
+                                    `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=${limit}&offset=${offset}&fields=items(track(name,artists(name),album(name,images),duration_ms,external_ids))`,
+                                    { headers: { 'Authorization': `Bearer ${token}` } }
+                                );
+                                if (!pageRes.ok) break;
+                                const pageJson = await pageRes.json();
+                                const items = pageJson.items || [];
+                                if (items.length === 0) break;
+
+                                for (const item of items) {
+                                    const t = item.track;
+                                    if (!t || !t.name) continue;
+                                    allTracks.push({
+                                        title: t.name,
+                                        artist: (t.artists || []).map(a => a.name).join(', ') || 'Unknown',
+                                        album: t.album?.name || '',
+                                        duration_ms: t.duration_ms || 0,
+                                        cover_url: t.album?.images?.[0]?.url || null,
+                                        isrc: t.external_ids?.isrc || null
+                                    });
+                                }
+
+                                offset += limit;
+                                this.log(`Loaded ${allTracks.length}/${total} tracks…`, 'info');
+                            }
+
+                            playlistData = {
+                                title: meta.name || 'Spotify Import',
+                                image: meta.images?.[0]?.url || null,
+                                owner: meta.owner?.display_name || null,
+                                total: allTracks.length,
+                                tracks: allTracks
+                            };
+                        }
+                    } catch (e) {
+                        console.warn('[SpotifyImporter] Official API paging error:', e);
+                    }
                 }
 
-                const total = data.tracks.length;
-                let processed = 0, successes = 0, notFound = 0;
-                const concurrency = Math.max(2, Math.min(10, this.settings.concurrency || 6));
-                const queue = data.tracks.map((t, i) => ({ track: t, idx: i }));
+                // Fallback to Public Vercel Proxy if token method fails
+                if (!playlistData) {
+                    playlistData = await this.fetchPlaylistFromPublicAPI(playlistId);
+                }
+
+                this.importedPlaylistData = playlistData;
+                this.showPlaylistPreview(playlistData);
+                this.setStatus('Ready to convert', 'idle');
+            } catch (err) {
+                console.error(err);
+                this.log(`Error: ${err.message}`, 'error');
+                this.setStatus('Failed', 'err');
+            }
+        },
+
+        async fetchPlaylistFromPublicAPI(playlistId) {
+            this.log('Fetching playlist via public proxy…', 'info');
+            const limit = 100;
+            let offset = 0, allTracks = [], playlistMeta = null, total = 0, page = 1;
+
+            while (true) {
+                const url = `${this.NEW_SPOTIFY_API_BASE}/${playlistId}?limit=${limit}&offset=${offset}`;
+                const response = await this.api.fetch(url);
+                if (!response.ok) throw new Error(`API error: ${response.status}`);
+                const json = await response.json();
+                if (!json.success || !json.data) throw new Error('Invalid API response');
+                const data = json.data;
+
+                if (!playlistMeta) {
+                    playlistMeta = {
+                        title: data.name || 'Spotify Import',
+                        description: data.description || '',
+                        image: data.image || null,
+                        owner: data.owner || null
+                    };
+                    total = data.total || 0;
+                }
+
+                const pageTracks = (data.tracks || []).map(t => ({
+                    title: t.name,
+                    artist: Array.isArray(t.artists) ? t.artists.join(', ') : (t.artist || 'Unknown'),
+                    album: t.album,
+                    duration_ms: t.duration_ms,
+                    cover_url: t.image || null,
+                    isrc: null
+                }));
+
+                allTracks = allTracks.concat(pageTracks);
+                this.log(`Page ${page}: ${pageTracks.length} tracks (${allTracks.length}/${total})`, 'info');
+
+                if (!data.next || pageTracks.length === 0 || allTracks.length >= total) {
+                    break;
+                }
+                offset += limit;
+                page++;
+            }
+
+            return { ...playlistMeta, total: allTracks.length, tracks: allTracks };
+        },
+
+        async fetchAndPreviewAlbum(albumId) {
+            this.log(`Loading album (ID: ${albumId})…`, 'info');
+            this.setStatus('Loading album…', 'active');
+            try {
+                // Fetch embed page for album
+                const embedRes = await this.api.fetch(`https://open.spotify.com/embed/album/${albumId}`);
+                if (!embedRes.ok) throw new Error('Could not load album embed');
+                const html = await embedRes.text();
+                const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+                if (!nextDataMatch) throw new Error('Could not parse album data');
+                const nextData = JSON.parse(nextDataMatch[1]);
+                const entity = nextData.props?.pageProps?.state?.data?.entity;
+                if (!entity) throw new Error('Album metadata not found');
+
+                const albumTracks = (entity.trackList || []).map(t => ({
+                    title: t.title,
+                    artist: (t.artists || []).map(a => a.name).join(', ') || entity.subtitle || 'Unknown',
+                    album: entity.name,
+                    duration_ms: t.duration,
+                    cover_url: entity.visualIdentity?.image?.[0]?.url || null,
+                    isrc: null
+                }));
+
+                const albumData = {
+                    title: entity.name,
+                    image: entity.visualIdentity?.image?.[0]?.url || null,
+                    owner: entity.subtitle || null,
+                    total: albumTracks.length,
+                    tracks: albumTracks
+                };
+
+                this.importedPlaylistData = albumData;
+                this.showPlaylistPreview(albumData);
+                this.setStatus('Ready to convert', 'idle');
+            } catch (err) {
+                console.error(err);
+                this.log(`Album fetch error: ${err.message}`, 'error');
+                this.setStatus('Failed', 'err');
+            }
+        },
+
+        showPlaylistPreview(data) {
+            const art = document.getElementById('sc2-prev-art');
+            if (data.image) {
+                art.innerHTML = `<img src="${data.image}" alt="">`;
+            } else {
+                art.innerHTML = `<span style="font-size:20px">📁</span>`;
+            }
+            document.getElementById('sc2-prev-name').textContent = data.title || 'Playlist';
+            const ownerEl = document.getElementById('sc2-prev-owner');
+            if (data.owner) {
+                document.getElementById('sc2-prev-owner-text').textContent = data.owner;
+                ownerEl.style.display = 'flex';
+            } else {
+                ownerEl.style.display = 'none';
+            }
+            const total = data.total || data.tracks.length;
+            const fetched = data.tracks.length;
+            document.getElementById('sc2-prev-count').textContent =
+                (data.total && data.total > fetched) ? `${fetched} of ${total} tracks` : `${total} tracks`;
+            document.getElementById('sc2-prev-badge').textContent = 'PLAYLIST';
+            document.getElementById('sc2-preview').style.display = 'flex';
+        },
+
+        // ── Conversion Execution ────────────────────────────────────────────
+        async startImportProcess() {
+            if (this.detectedType === 'track') {
+                return this.saveSingleTrack();
+            }
+
+            // Playlist or Album
+            const convertBtn = document.getElementById('sc2-convert');
+            const stopBtn = document.getElementById('sc2-stop');
+            const urlEl = document.getElementById('sc2-url');
+
+            let playlistData = this.importedPlaylistData;
+            if (!playlistData) {
+                this.log('Please enter a valid Spotify URL or upload a JSON backup.', 'error');
+                return;
+            }
+
+            this.isConverting = true;
+            this.stopConversion = false;
+            this.abortController = new AbortController();
+            convertBtn.disabled = true;
+            stopBtn.disabled = false;
+            urlEl.disabled = true;
+            this.updateProgress(0);
+            this.updateStats('—', '—', '—');
+            this.setStatus('Converting…', 'active');
+
+            document.getElementById('sc2-log').innerHTML = '';
+            this.log('━━━━━━━━━━━━━━━━━━━━━━━', 'divider');
+            this.log(`Playlist: ${playlistData.title}`, 'info');
+            this.log(`${playlistData.tracks.length} tracks to process`, 'info');
+            this.log('━━━━━━━━━━━━━━━━━━━━━━━', 'divider');
+
+            try {
+                const existingTracks = await this.getLibraryIndex();
+                this.log(`${existingTracks.size} existing tracks in library index`, 'info');
+
+                const audionPlaylistId = await this.api.library.createPlaylist(playlistData.title, playlistData.image);
+                this.log('Playlist created in Audion', 'success');
+
+                const total = playlistData.tracks.length;
+                let processed = 0, successes = 0, fromLibrary = 0, notFound = 0;
+                const concurrency = 5;
+                const queue = playlistData.tracks.map((track, idx) => ({ track, idx }));
                 const inFlight = new Map();
 
-                const worker = async () => {
-                    while (queue.length > 0 && !this.stopRequested) {
+                const searchWorker = async () => {
+                    while (queue.length > 0 && !this.stopConversion) {
                         const item = queue.shift();
                         if (!item) break;
                         const { track, idx } = item;
-                        const cacheKey = `${track.title.toLowerCase()}|${track.artist.toLowerCase()}`;
+                        const key = `${this.normalizeString(track.title)}|${this.normalizeString(track.artist)}`;
 
                         let trackId = null;
-                        if (this.trackCache.has(cacheKey)) {
-                            trackId = this.trackCache.get(cacheKey);
-                            successes++;
-                        } else if (inFlight.has(cacheKey)) {
+                        if (this.trackCache.has(key)) {
+                            trackId = this.trackCache.get(key);
+                            fromLibrary++;
+                        } else if (inFlight.has(key)) {
                             try {
-                                trackId = await inFlight.get(cacheKey);
+                                trackId = await inFlight.get(key);
                                 if (trackId) successes++; else notFound++;
                             } catch (e) { notFound++; }
                         } else {
                             const searchPromise = (async () => {
                                 try {
-                                    const results = await this.searchAllSources(track, this.abortController.signal);
-                                    const best = this.pickBestResult(results);
+                                    const allResults = await this.searchAllSources(track, this.abortController.signal);
+                                    const best = this.pickBestResult(allResults);
                                     if (best) {
                                         if (!best.cover_url && track.cover_url) best.cover_url = track.cover_url;
-                                        const libKey = `${best.source_type}:${best.external_id}`;
-                                        let resId;
-                                        if (existingTracks.has(libKey)) {
-                                            resId = existingTracks.get(libKey);
+                                        const libraryKey = `${best.source_type}:${best.external_id}`;
+                                        let resolvedId;
+                                        if (existingTracks.has(libraryKey)) {
+                                            resolvedId = existingTracks.get(libraryKey);
                                         } else {
-                                            resId = await this.addTrackToLibrary(best);
-                                            existingTracks.set(libKey, resId);
+                                            resolvedId = await this.addTrackToLibrary(best);
+                                            existingTracks.set(libraryKey, resolvedId);
                                         }
-                                        this.trackCache.set(cacheKey, resId);
-                                        return resId;
+                                        this.trackCache.set(key, resolvedId);
+                                        return resolvedId;
                                     }
                                     return null;
                                 } catch (err) {
+                                    if (err.name === 'AbortError') throw err;
                                     return null;
                                 }
                             })();
 
-                            inFlight.set(cacheKey, searchPromise);
-                            trackId = await searchPromise;
-                            inFlight.delete(cacheKey);
-
-                            if (trackId) successes++; else notFound++;
-                        }
-
-                        // Add track to the created playlist
-                        if (trackId && audionPlaylistId && this.api?.library?.addTrackToPlaylist) {
+                            inFlight.set(key, searchPromise);
                             try {
-                                await this.api.library.addTrackToPlaylist(audionPlaylistId, trackId);
+                                trackId = await searchPromise;
+                                if (trackId) successes++; else notFound++;
                             } catch (err) {
-                                console.warn(`Failed to add track to playlist: ${track.title}`);
+                                if (err.name === 'AbortError') break;
+                                notFound++;
+                            } finally {
+                                inFlight.delete(key);
                             }
                         }
 
+                        // Add track to Audion Playlist
+                        if (trackId && audionPlaylistId) {
+                            try {
+                                await this.api.library.addTrackToPlaylist(audionPlaylistId, trackId);
+                            } catch (e) { }
+                        }
+
                         processed++;
-                        const pct = Math.round((processed / total) * 100);
-                        this.updateProgress(pct);
-                        this.updateStats(processed, successes, notFound);
+                        this.updateProgress((processed / total) * 100);
+                        this.updateStats(successes, fromLibrary, notFound);
                     }
                 };
 
-                // Launch concurrent workers
-                const workers = Array.from({ length: concurrency }, () => worker());
+                const workers = Array.from({ length: concurrency }, () => searchWorker());
                 await Promise.all(workers);
 
-                if (this.stopRequested) {
-                    this.log('Import stopped by user.', 'warn');
+                if (this.stopConversion) {
+                    this.log('Conversion stopped by user.', 'warn');
                     this.setStatus('Stopped', 'idle');
                 } else {
-                    this.log(`Finished! Successfully imported ${successes} of ${total} songs into "${data.title}".`, 'success');
-                    this.setStatus('Completed', 'ok');
-                    if (this.api?.system?.notify) {
-                        this.api.system.notify('Spotify Import Complete', `Added ${successes} songs to ${data.title}`);
-                    }
+                    this.log(`Finished! Successfully added ${successes + fromLibrary} of ${total} songs to "${playlistData.title}".`, 'success');
+                    this.setStatus('Done', 'done');
                 }
             } catch (err) {
-                console.error('[SpotifyImporter] Import error:', err);
-                this.log(`Import error: ${err.message}`, 'error');
+                console.error(err);
+                this.log(`Error: ${err.message}`, 'error');
                 this.setStatus('Failed', 'err');
             } finally {
                 this.isConverting = false;
-                if (convertBtn) convertBtn.disabled = false;
-                if (stopBtn) stopBtn.disabled = true;
+                convertBtn.disabled = false;
+                stopBtn.disabled = true;
+                urlEl.disabled = false;
             }
         },
 
-        stopConversion() {
-            this.stopRequested = true;
-            if (this.abortController) {
-                this.abortController.abort();
-            }
+        stopConversionProcess() {
+            this.stopConversion = true;
+            if (this.abortController) this.abortController.abort();
         },
 
-        // ── Main UI Modal ────────────────────────────────────────────
-
-        createUIButtons() {
-            // Player bar button
-            const barBtn = document.createElement('button');
-            barBtn.id = 'sui-bar-btn';
-            barBtn.className = 'sui-icon-btn';
-            barBtn.title = 'Spotify Universal Importer';
-            barBtn.innerHTML = `
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/>
-                </svg>
-            `;
-            barBtn.onclick = () => this.toggleModal();
-
-            // Menu button
-            const menuBtn = document.createElement('div');
-            menuBtn.className = 'sui-menu-item';
-            menuBtn.innerHTML = `<span>Spotify Importer</span>`;
-            menuBtn.onclick = () => this.toggleModal();
-
-            if (this.api?.ui?.registerSlot) {
-                this.api.ui.registerSlot('playerbar:right', barBtn, 15);
-                this.api.ui.registerSlot('playerbar:menu', menuBtn, 15);
-            }
-        },
-
-        createModal() {
-            if (document.getElementById('sui-overlay')) return;
-
-            const overlay = document.createElement('div');
-            overlay.id = 'sui-overlay';
-            overlay.className = 'sui-overlay hidden';
-            overlay.innerHTML = `
-                <div class="sui-backdrop" id="sui-backdrop"></div>
-                <div class="sui-dialog">
-                    <header class="sui-header">
-                        <div class="sui-brand">
-                            <span class="sui-spotify-icon"></span>
-                            <h2>Spotify Universal Importer</h2>
-                        </div>
-                        <button class="sui-close" id="sui-close-btn">&times;</button>
-                    </header>
-
-                    <nav class="sui-tabs">
-                        <button class="sui-tab active" data-tab="import">Import Music</button>
-                        <button class="sui-tab" data-tab="settings">API Settings</button>
-                    </nav>
-
-                    <div class="sui-body">
-                        <!-- TAB 1: IMPORT -->
-                        <div class="sui-tab-panel" id="sui-panel-import">
-                            <div class="sui-input-group">
-                                <label for="sui-url-input">Enter Spotify URL or URI</label>
-                                <div class="sui-input-row">
-                                    <input type="text" id="sui-url-input" class="sui-input" placeholder="Paste Spotify Playlist, Album, or Track link (e.g. open.spotify.com/track/...)" />
-                                    <button class="sui-btn primary" id="sui-btn-fetch">Fetch</button>
-                                </div>
-                                <span class="sui-hint">Supports full playlists (500+ tracks), entire albums, and single tracks.</span>
-                            </div>
-
-                            <!-- Preview Box -->
-                            <div class="sui-preview hidden" id="sui-preview-box">
-                                <img id="sui-prev-img" class="sui-prev-img" src="" alt="" />
-                                <div class="sui-prev-meta">
-                                    <h4 id="sui-prev-title">Title</h4>
-                                    <p id="sui-prev-sub">Details</p>
-                                    <span class="sui-prev-badge" id="sui-prev-type">PLAYLIST</span>
-                                </div>
-                                <div class="sui-prev-actions">
-                                    <button class="sui-btn primary" id="sui-btn-convert">Start Import</button>
-                                    <button class="sui-btn danger" id="sui-btn-stop" disabled>Stop</button>
-                                </div>
-                            </div>
-
-                            <!-- Progress & Stats -->
-                            <div class="sui-progress-section hidden" id="sui-progress-box">
-                                <div class="sui-progress-bar-bg">
-                                    <div class="sui-progress-bar-fill" id="sui-progress-fill" style="width: 0%"></div>
-                                </div>
-                                <div class="sui-stats-row">
-                                    <span>Processed: <strong id="sui-stat-proc">0</strong></span>
-                                    <span>Matched: <strong id="sui-stat-matched" class="text-green">0</strong></span>
-                                    <span>Not Found: <strong id="sui-stat-missed" class="text-red">0</strong></span>
-                                    <span>Status: <strong id="sui-stat-status">Ready</strong></span>
-                                </div>
-                            </div>
-
-                            <!-- Live Activity Log -->
-                            <div class="sui-log-box" id="sui-log">
-                                <div class="sui-log-item info">Ready. Paste any Spotify URL above to begin.</div>
-                            </div>
-                        </div>
-
-                        <!-- TAB 2: SETTINGS -->
-                        <div class="sui-tab-panel hidden" id="sui-panel-settings">
-                            <div class="sui-card">
-                                <h3>Official Spotify Developer API (Optional)</h3>
-                                <p class="sui-p">Entering your free Spotify API keys completely unlocks unlimited 5,000+ track playlists with zero rate limits and blazing speed.</p>
-                                
-                                <div class="sui-field">
-                                    <label>Client ID</label>
-                                    <input type="text" id="sui-cfg-client-id" class="sui-input" placeholder="e.g. 4a8b7c..." />
-                                </div>
-                                <div class="sui-field">
-                                    <label>Client Secret</label>
-                                    <input type="password" id="sui-cfg-client-secret" class="sui-input" placeholder="e.g. 9f1e2d..." />
-                                </div>
-
-                                <div class="sui-field">
-                                    <label>Search Concurrency (Worker Threads)</label>
-                                    <input type="number" id="sui-cfg-concurrency" class="sui-input" min="2" max="10" value="6" />
-                                    <span class="sui-hint">Higher values import faster. Default: 6</span>
-                                </div>
-
-                                <button class="sui-btn primary" id="sui-btn-save-cfg">Save Settings</button>
-
-                                <div class="sui-guide">
-                                    <strong>How to get free Spotify API keys in 1 minute:</strong>
-                                    <ol>
-                                        <li>Log in to <a href="https://developer.spotify.com/dashboard" target="_blank">developer.spotify.com/dashboard</a></li>
-                                        <li>Click <strong>Create App</strong> (App Name: "Audion", Redirect URI: <code>http://localhost</code>)</li>
-                                        <li>Click <strong>Settings</strong> to view your <strong>Client ID</strong> and <strong>Client Secret</strong>.</li>
-                                    </ol>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- SINGLE TRACK SAVE DESTINATION MODAL -->
-                <div class="sui-modal-dialog hidden" id="sui-single-prompt">
-                    <div class="sui-prompt-card">
-                        <h3>Choose Where to Save Track</h3>
-                        <div class="sui-track-preview-row">
-                            <img id="sui-st-cover" class="sui-track-thumb" src="" alt="" />
-                            <div>
-                                <h4 id="sui-st-title">Track Title</h4>
-                                <p id="sui-st-artist">Artist Name</p>
-                            </div>
-                        </div>
-
-                        <div class="sui-dest-options">
-                            <label class="sui-radio-row">
-                                <input type="radio" name="sui-dest" value="library" checked />
-                                <span>Add to Main Library</span>
-                            </label>
-
-                            <label class="sui-radio-row">
-                                <input type="radio" name="sui-dest" value="existing_playlist" />
-                                <span>Add to an Existing Playlist:</span>
-                            </label>
-                            <select id="sui-st-playlist-select" class="sui-input sui-select"></select>
-
-                            <label class="sui-radio-row">
-                                <input type="radio" name="sui-dest" value="new_playlist" />
-                                <span>Create a New Playlist:</span>
-                            </label>
-                            <input type="text" id="sui-st-new-playlist-name" class="sui-input" placeholder="e.g. My Favorites" />
-
-                            <label class="sui-radio-row">
-                                <input type="radio" name="sui-dest" value="download" />
-                                <span>Download to Local Computer (MP3)</span>
-                            </label>
-                        </div>
-
-                        <div class="sui-prompt-actions">
-                            <button class="sui-btn" id="sui-st-cancel">Cancel</button>
-                            <button class="sui-btn primary" id="sui-st-confirm">Save Track</button>
-                        </div>
-                    </div>
-                </div>
-            `;
-
-            document.body.appendChild(overlay);
-            this.bindEvents();
-        },
-
-        bindEvents() {
-            // Close modal
-            document.getElementById('sui-close-btn')?.addEventListener('click', () => this.closeModal());
-            document.getElementById('sui-backdrop')?.addEventListener('click', () => this.closeModal());
-
-            // Tab switching
-            const tabs = document.querySelectorAll('.sui-tab');
-            tabs.forEach(tab => {
-                tab.addEventListener('click', () => {
-                    tabs.forEach(t => t.classList.remove('active'));
-                    tab.classList.add('active');
-                    const target = tab.getAttribute('data-tab');
-                    document.getElementById('sui-panel-import')?.classList.toggle('hidden', target !== 'import');
-                    document.getElementById('sui-panel-settings')?.classList.toggle('hidden', target !== 'settings');
-                });
-            });
-
-            // Fetch Button
-            const urlInput = document.getElementById('sui-url-input');
-            const fetchBtn = document.getElementById('sui-btn-fetch');
-            const onFetchClick = async () => {
-                const raw = urlInput?.value?.trim();
-                if (!raw) return alert('Please enter a Spotify link or URI.');
-
-                const parsed = this.parseSpotifyInput(raw);
-                if (!parsed) {
-                    this.log('Invalid Spotify URL. Please paste a valid playlist, album, or track link.', 'error');
-                    return;
-                }
-                this.parsedItem = parsed;
-
+        // ── JSON Upload Handling ────────────────────────────────────────────
+        handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            this.log(`Reading ${file.name}…`, 'info');
+            const reader = new FileReader();
+            reader.onload = (e) => {
                 try {
-                    this.setStatus('Fetching...', 'active');
-                    if (parsed.type === 'track') {
-                        const trackData = await this.fetchTrack(parsed.id, parsed.rawUrl);
-                        this.openSingleTrackPrompt(trackData);
-                    } else if (parsed.type === 'playlist') {
-                        const playlistData = await this.fetchPlaylist(parsed.id);
-                        this.showPreview(playlistData, 'PLAYLIST');
-                    } else if (parsed.type === 'album') {
-                        const albumData = await this.fetchAlbum(parsed.id);
-                        this.showPreview(albumData, 'ALBUM');
-                    }
+                    const json = JSON.parse(e.target.result);
+                    let playlistData = {
+                        title: json.title || json.name || file.name.replace('.json', ''),
+                        image: json.image || json.cover_url || null,
+                        tracks: (Array.isArray(json) ? json : json.tracks || []).map(t => ({
+                            title: t.title || t.name || 'Unknown',
+                            artist: Array.isArray(t.artist) ? t.artist.join(', ') : (t.artist || 'Unknown'),
+                            album: t.album || '',
+                            duration_ms: t.duration_ms || 180000,
+                            cover_url: t.cover_url || t.image || null,
+                            isrc: t.isrc || null
+                        }))
+                    };
+                    this.importedPlaylistData = playlistData;
+                    this.detectedType = 'playlist';
+                    document.getElementById('sc2-pill-text').textContent = `${playlistData.tracks.length} tracks · ${file.name}`;
+                    document.getElementById('sc2-pill').style.display = 'flex';
+                    document.getElementById('sc2-json-label').style.display = 'none';
+                    document.getElementById('sc2-url').value = '';
+                    document.getElementById('sc2-url').placeholder = 'Using uploaded JSON…';
+                    document.getElementById('sc2-url').disabled = true;
+                    this.showPlaylistPreview(playlistData);
+                    this.log(`Loaded ${playlistData.tracks.length} tracks from JSON.`, 'success');
                 } catch (err) {
-                    this.log(`Error: ${err.message}`, 'error');
-                    this.setStatus('Error', 'err');
+                    this.log('Invalid JSON file.', 'error');
                 }
             };
-
-            fetchBtn?.addEventListener('click', onFetchClick);
-            urlInput?.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') onFetchClick();
-            });
-
-            // Start Batch Convert
-            document.getElementById('sui-btn-convert')?.addEventListener('click', () => {
-                if (this.parsedItem?.data) {
-                    document.getElementById('sui-progress-box')?.classList.remove('hidden');
-                    this.processBatchImport(this.parsedItem.data);
-                }
-            });
-
-            // Stop Convert
-            document.getElementById('sui-btn-stop')?.addEventListener('click', () => {
-                this.stopConversion();
-            });
-
-            // Save Settings
-            document.getElementById('sui-btn-save-cfg')?.addEventListener('click', () => {
-                const cid = document.getElementById('sui-cfg-client-id')?.value?.trim();
-                const sec = document.getElementById('sui-cfg-client-secret')?.value?.trim();
-                const conc = parseInt(document.getElementById('sui-cfg-concurrency')?.value, 10);
-
-                this.settings.clientId = cid || '';
-                this.settings.clientSecret = sec || '';
-                this.settings.concurrency = isNaN(conc) ? 6 : conc;
-                this.saveSettings();
-                this.spotifyAccessToken = null; // Invalidate cached token
-                alert('Settings saved successfully!');
-            });
-
-            // Single Track Prompt Actions
-            document.getElementById('sui-st-cancel')?.addEventListener('click', () => {
-                this.closeSingleTrackPrompt();
-            });
-
-            document.getElementById('sui-st-confirm')?.addEventListener('click', () => {
-                const selectedRadio = document.querySelector('input[name="sui-dest"]:checked');
-                const dest = selectedRadio ? selectedRadio.value : 'library';
-                const plSelect = document.getElementById('sui-st-playlist-select');
-                const newPlInput = document.getElementById('sui-st-new-playlist-name');
-
-                this.executeSingleTrackSave(dest, {
-                    playlistId: plSelect ? plSelect.value : null,
-                    playlistName: newPlInput ? newPlInput.value.trim() : null
-                });
-            });
+            reader.readAsText(file);
         },
 
-        showPreview(data, typeBadge) {
-            this.parsedItem.data = data;
-            const box = document.getElementById('sui-preview-box');
-            const img = document.getElementById('sui-prev-img');
-            const title = document.getElementById('sui-prev-title');
-            const sub = document.getElementById('sui-prev-sub');
-            const badge = document.getElementById('sui-prev-type');
-
-            if (img) img.src = data.image || 'https://via.placeholder.com/150';
-            if (title) title.textContent = data.title;
-            if (sub) sub.textContent = `${data.total} tracks ready to import`;
-            if (badge) badge.textContent = typeBadge;
-
-            if (box) box.classList.remove('hidden');
+        clearFile() {
+            this.importedPlaylistData = null;
+            document.getElementById('sc2-file').value = '';
+            document.getElementById('sc2-url').value = '';
+            document.getElementById('sc2-url').disabled = false;
+            document.getElementById('sc2-url').placeholder = 'Paste Spotify Playlist, Album, or Track URL...';
+            document.getElementById('sc2-pill').style.display = 'none';
+            document.getElementById('sc2-json-label').style.display = 'flex';
+            document.getElementById('sc2-preview').style.display = 'none';
+            this.log('File removed.', 'info');
         },
 
-        toggleModal() {
-            if (this.isOpen) this.closeModal(); else this.openModal();
-        },
-
-        openModal() {
-            this.isOpen = true;
-            document.getElementById('sui-overlay')?.classList.remove('hidden');
-
-            // Populate current settings into inputs
-            const cid = document.getElementById('sui-cfg-client-id');
-            const sec = document.getElementById('sui-cfg-client-secret');
-            const conc = document.getElementById('sui-cfg-concurrency');
-            if (cid) cid.value = this.settings.clientId || '';
-            if (sec) sec.value = this.settings.clientSecret || '';
-            if (conc) conc.value = this.settings.concurrency || 6;
-        },
-
-        closeModal() {
-            this.isOpen = false;
-            document.getElementById('sui-overlay')?.classList.add('hidden');
-        },
-
-        updateFetchStatus(msg) {
-            this.log(msg, 'info');
+        // ── Log & Stats Helpers ─────────────────────────────────────────────
+        log(msg, type = 'info') {
+            const log = document.getElementById('sc2-log');
+            if (!log) return;
+            const line = document.createElement('div');
+            line.className = `sc2-log-line ${type}`;
+            line.innerHTML = `<span class="sc2-log-arrow">›</span><span class="sc2-log-msg">${msg}</span>`;
+            log.appendChild(line);
+            log.scrollTop = log.scrollHeight;
         },
 
         updateProgress(percent) {
-            const bar = document.getElementById('sui-progress-fill');
-            if (bar) bar.style.width = `${percent}%`;
+            const p = Math.round(percent);
+            const fill = document.getElementById('sc2-prog-fill');
+            const pct = document.getElementById('sc2-prog-pct');
+            if (fill) fill.style.width = `${p}%`;
+            if (pct) pct.textContent = `${p}%`;
         },
 
-        updateStats(proc, matched, missed) {
-            const elProc = document.getElementById('sui-stat-proc');
-            const elMatched = document.getElementById('sui-stat-matched');
-            const elMissed = document.getElementById('sui-stat-missed');
-            if (elProc) elProc.textContent = proc;
-            if (elMatched) elMatched.textContent = matched;
-            if (elMissed) elMissed.textContent = missed;
+        updateStats(n, l, m) {
+            const sN = document.getElementById('sc2-stat-new');
+            const sL = document.getElementById('sc2-stat-lib');
+            const sM = document.getElementById('sc2-stat-miss');
+            if (sN) sN.textContent = n;
+            if (sL) sL.textContent = l;
+            if (sM) sM.textContent = m;
         },
 
-        setStatus(text, type) {
-            const el = document.getElementById('sui-stat-status');
-            if (!el) return;
-            el.textContent = text;
-            el.className = type === 'ok' ? 'text-green' : (type === 'err' ? 'text-red' : '');
-        },
-
-        log(msg, type = 'info') {
-            const box = document.getElementById('sui-log');
-            if (!box) return;
-            const div = document.createElement('div');
-            div.className = `sui-log-item ${type}`;
-            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-            box.prepend(div);
-        },
-
-        // ── Stylesheet ───────────────────────────────────────────────
-
-        injectStyles() {
-            if (document.getElementById('sui-styles')) return;
-            const style = document.createElement('style');
-            style.id = 'sui-styles';
-            style.textContent = `
-                .sui-icon-btn {
-                    background: transparent;
-                    border: none;
-                    color: var(--text-secondary, #b3b3b3);
-                    cursor: pointer;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    padding: 8px;
-                    border-radius: 50%;
-                    transition: all 0.2s ease;
-                }
-                .sui-icon-btn:hover {
-                    color: #1ed760;
-                    background: rgba(30, 215, 96, 0.1);
-                }
-
-                .sui-menu-item {
-                    padding: 10px 14px;
-                    color: #fff;
-                    cursor: pointer;
-                    font-size: 14px;
-                }
-                .sui-menu-item:hover {
-                    background: rgba(255, 255, 255, 0.08);
-                }
-
-                .sui-overlay {
-                    position: fixed; inset: 0;
-                    z-index: 99999;
-                    display: flex; align-items: center; justify-content: center;
-                }
-                .sui-overlay.hidden, .sui-modal-dialog.hidden, .sui-tab-panel.hidden, .hidden {
-                    display: none !important;
-                }
-
-                .sui-backdrop {
-                    position: absolute; inset: 0;
-                    background: rgba(0, 0, 0, 0.75);
-                    backdrop-filter: blur(6px);
-                }
-
-                .sui-dialog {
-                    position: relative;
-                    width: 720px;
-                    max-width: 90vw;
-                    max-height: 85vh;
-                    background: var(--bg-surface, #181818);
-                    border: 1px solid var(--border-color, #282828);
-                    border-radius: 12px;
-                    color: var(--text-primary, #fff);
-                    box-shadow: 0 20px 48px rgba(0, 0, 0, 0.7);
-                    display: flex; flex-direction: column;
-                    overflow: hidden;
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                }
-
-                .sui-header {
-                    display: flex; align-items: center; justify-content: space-between;
-                    padding: 16px 20px;
-                    border-bottom: 1px solid #282828;
-                }
-                .sui-brand {
-                    display: flex; align-items: center; gap: 10px;
-                }
-                .sui-brand h2 {
-                    margin: 0; font-size: 17px; font-weight: 600;
-                }
-                .sui-spotify-icon {
-                    width: 20px; height: 20px;
-                    background: #1ed760;
-                    border-radius: 50%;
-                    display: inline-block;
-                }
-                .sui-close {
-                    background: transparent; border: none;
-                    color: #888; font-size: 24px; cursor: pointer;
-                }
-                .sui-close:hover { color: #fff; }
-
-                .sui-tabs {
-                    display: flex;
-                    background: var(--bg-base, #121212);
-                    border-bottom: 1px solid #282828;
-                }
-                .sui-tab {
-                    padding: 12px 20px;
-                    background: transparent; border: none;
-                    border-bottom: 2px solid transparent;
-                    color: #888; font-size: 13px; font-weight: 500; cursor: pointer;
-                }
-                .sui-tab.active {
-                    color: #1ed760; border-bottom-color: #1ed760;
-                }
-
-                .sui-body {
-                    padding: 20px; overflow-y: auto; flex: 1;
-                    display: flex; flex-direction: column; gap: 16px;
-                }
-
-                .sui-input-group label {
-                    display: block; font-size: 13px; margin-bottom: 6px; color: #bbb;
-                }
-                .sui-input-row {
-                    display: flex; gap: 8px;
-                }
-                .sui-input {
-                    flex: 1; padding: 10px 14px;
-                    background: #101010; border: 1px solid #333;
-                    border-radius: 6px; color: #fff; font-size: 13px;
-                }
-                .sui-input:focus {
-                    outline: none; border-color: #1ed760;
-                }
-                .sui-hint {
-                    display: block; margin-top: 6px; font-size: 11px; color: #777;
-                }
-
-                .sui-btn {
-                    padding: 9px 18px; background: #282828;
-                    border: 1px solid #3e3e3e; border-radius: 6px;
-                    color: #fff; font-size: 13px; font-weight: 500; cursor: pointer;
-                }
-                .sui-btn:hover { background: #333; }
-                .sui-btn.primary {
-                    background: #1ed760; color: #000; border: none; font-weight: 600;
-                }
-                .sui-btn.primary:hover { filter: brightness(1.1); }
-                .sui-btn.danger {
-                    background: #992323; border-color: #771d1d;
-                }
-                .sui-btn:disabled {
-                    opacity: 0.5; cursor: not-allowed;
-                }
-
-                .sui-preview {
-                    display: flex; align-items: center; gap: 16px;
-                    background: rgba(255, 255, 255, 0.03);
-                    border: 1px solid #282828; border-radius: 8px;
-                    padding: 12px 16px;
-                }
-                .sui-prev-img {
-                    width: 70px; height: 70px; border-radius: 6px; object-fit: cover;
-                }
-                .sui-prev-meta { flex: 1; }
-                .sui-prev-meta h4 { margin: 0 0 4px 0; font-size: 15px; }
-                .sui-prev-meta p { margin: 0 0 6px 0; font-size: 12px; color: #888; }
-                .sui-prev-badge {
-                    font-size: 10px; font-weight: 700; background: #1ed760;
-                    color: #000; padding: 2px 6px; border-radius: 4px;
-                }
-                .sui-prev-actions { display: flex; gap: 8px; }
-
-                .sui-progress-section {
-                    display: flex; flex-direction: column; gap: 8px;
-                }
-                .sui-progress-bar-bg {
-                    height: 8px; background: #282828; border-radius: 4px; overflow: hidden;
-                }
-                .sui-progress-bar-fill {
-                    height: 100%; background: #1ed760; transition: width 0.2s ease;
-                }
-                .sui-stats-row {
-                    display: flex; justify-content: space-between; font-size: 12px; color: #aaa;
-                }
-                .text-green { color: #1ed760; }
-                .text-red { color: #e74c3c; }
-
-                .sui-log-box {
-                    background: #0d0d0d; border-radius: 6px;
-                    border: 1px solid #222; padding: 10px 14px;
-                    max-height: 160px; overflow-y: auto;
-                    font-family: monospace; font-size: 11px;
-                }
-                .sui-log-item { padding: 2px 0; }
-                .sui-log-item.info { color: #aaa; }
-                .sui-log-item.success { color: #1ed760; }
-                .sui-log-item.warn { color: #f39c12; }
-                .sui-log-item.error { color: #e74c3c; }
-
-                .sui-card {
-                    background: rgba(255, 255, 255, 0.02);
-                    border: 1px solid #282828; border-radius: 8px; padding: 18px;
-                    display: flex; flex-direction: column; gap: 14px;
-                }
-                .sui-card h3 { margin: 0; font-size: 16px; }
-                .sui-p { margin: 0; font-size: 13px; color: #888; line-height: 1.5; }
-                .sui-field { display: flex; flex-direction: column; gap: 6px; }
-                .sui-field label { font-size: 12px; color: #bbb; }
-                .sui-guide {
-                    background: rgba(30, 215, 96, 0.05); border: 1px solid rgba(30, 215, 96, 0.2);
-                    border-radius: 6px; padding: 12px; font-size: 12px; color: #ccc;
-                }
-                .sui-guide ol { margin: 6px 0 0 16px; padding: 0; }
-                .sui-guide a { color: #1ed760; }
-
-                /* Single Track Destination Modal */
-                .sui-modal-dialog {
-                    position: fixed; inset: 0; z-index: 100000;
-                    background: rgba(0, 0, 0, 0.8);
-                    display: flex; align-items: center; justify-content: center;
-                }
-                .sui-prompt-card {
-                    width: 480px; max-width: 90vw; background: #1a1a1a;
-                    border: 1px solid #333; border-radius: 12px; padding: 22px;
-                    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.8);
-                    display: flex; flex-direction: column; gap: 16px;
-                }
-                .sui-prompt-card h3 { margin: 0; font-size: 17px; }
-                .sui-track-preview-row {
-                    display: flex; gap: 14px; align-items: center;
-                    background: #111; padding: 10px; border-radius: 8px;
-                }
-                .sui-track-thumb {
-                    width: 50px; height: 50px; border-radius: 6px; object-fit: cover;
-                }
-                .sui-track-preview-row h4 { margin: 0 0 3px 0; font-size: 14px; }
-                .sui-track-preview-row p { margin: 0; font-size: 12px; color: #888; }
-                .sui-dest-options {
-                    display: flex; flex-direction: column; gap: 10px;
-                }
-                .sui-radio-row {
-                    display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;
-                }
-                .sui-select { margin-left: 22px; width: calc(100% - 22px); }
-                #sui-st-new-playlist-name { margin-left: 22px; width: calc(100% - 22px); }
-                .sui-prompt-actions {
-                    display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px;
-                }
-            `;
-            document.head.appendChild(style);
+        setStatus(text, state = 'idle') {
+            const txt = document.getElementById('sc2-status-txt');
+            const dot = document.getElementById('sc2-status-dot');
+            if (txt) txt.textContent = text;
+            if (dot) {
+                dot.className = 'sc2-status-dot';
+                if (state !== 'idle') dot.classList.add(state);
+            }
         }
     };
 
