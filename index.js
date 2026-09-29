@@ -13,7 +13,7 @@
         singleTrackData: null,
         detectedType: null, // 'playlist' | 'track' | 'album'
 
-        NEW_SPOTIFY_API_BASE: 'https://spotify-api-henna.vercel.app/api/playlist',
+        PLAYLIST_API: 'https://spotify-api-henna.vercel.app/api/playlist',
         trackCache: new Map(),
         cachedPlaylists: [],
 
@@ -26,6 +26,43 @@
             console.log('[SpotifyImporter] Ready.');
         },
 
+        // ── Fetch helpers ────────────────────────────────────────────────────
+
+        /**
+         * Fetch a Spotify embed page and extract __NEXT_DATA__ JSON.
+         * Works for: track, album, playlist embed pages.
+         */
+        async fetchEmbedData(type, id) {
+            const url = `https://open.spotify.com/embed/${type}/${id}`;
+            const res = await this.api.fetch(url, {
+                headers: { 'Accept': 'text/html', 'User-Agent': 'Mozilla/5.0' }
+            });
+            if (!res.ok) throw new Error(`Embed page returned ${res.status}`);
+            const html = await res.text();
+
+            const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+            if (!match) throw new Error('__NEXT_DATA__ not found in embed page');
+
+            const nextData = JSON.parse(match[1]);
+            const entity = nextData?.props?.pageProps?.state?.data?.entity;
+            if (!entity) throw new Error('entity not found in __NEXT_DATA__');
+
+            // Extract the live session access token (useful for playlist pagination)
+            const token = nextData?.props?.pageProps?.state?.session?.accessToken || null;
+            return { entity, token };
+        },
+
+        /**
+         * Fetch basic metadata via oEmbed (no auth needed).
+         * Returns: { title, thumbnail_url }
+         */
+        async fetchOEmbed(type, id) {
+            const url = `https://open.spotify.com/oembed?url=${encodeURIComponent(`https://open.spotify.com/${type}/${id}`)}`;
+            const res = await this.api.fetch(url);
+            if (!res.ok) throw new Error(`oEmbed returned ${res.status}`);
+            return await res.json();
+        },
+
         // ── Smart Multi-Stage Source Search ─────────────────────────────────
         async searchAllSources(spotifyTrack, signal) {
             // Stage 1: Exact search
@@ -35,7 +72,7 @@
             );
             if (results.some(r => r.status === 'success')) return results;
 
-            // Stage 2: Clean title & artist (remove "(Female Version)", "[Official]", "- From...", featured artists)
+            // Stage 2: Clean title & artist
             const cleanTitle = this.cleanSongTitle(spotifyTrack.title);
             const cleanArtist = this.cleanArtistName(spotifyTrack.artist);
 
@@ -47,19 +84,16 @@
                 if (results.some(r => r.status === 'success')) return results;
             }
 
-            // Stage 3: Combined string search query
+            // Stage 3: Combined string
             results = await this.querySearch(
                 { title: `${cleanTitle} ${cleanArtist}`.trim() },
                 signal
             );
             if (results.some(r => r.status === 'success')) return results;
 
-            // Stage 4: Title only search
+            // Stage 4: Title only
             if (cleanTitle.length > 2) {
-                results = await this.querySearch(
-                    { title: cleanTitle },
-                    signal
-                );
+                results = await this.querySearch({ title: cleanTitle }, signal);
             }
 
             return results;
@@ -96,7 +130,6 @@
 
         cleanArtistName(artist) {
             if (!artist) return '';
-            // If multiple artists, take the primary one for search
             return artist.split(/[,&/]|feat\.|ft\./i)[0].trim();
         },
 
@@ -149,7 +182,7 @@
             });
         },
 
-        // ── Styles (Matching Spotify Converter) ─────────────────────────────
+        // ── Styles ───────────────────────────────────────────────────────────
         injectStyles() {
             if (document.getElementById('sc2-styles')) return;
             const s = document.createElement('style');
@@ -213,7 +246,6 @@
                     flex: 1; min-height: 0; overflow: hidden;
                 }
 
-                /* Left panel */
                 .sc2-left {
                     border-right: 0.5px solid rgba(255,255,255,0.07);
                     display: flex; flex-direction: column;
@@ -254,34 +286,6 @@
                 }
                 .sc2-field-x:hover { background: #444; }
 
-                .sc2-sep { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
-                .sc2-sep-line { flex: 1; height: 0.5px; background: rgba(255,255,255,0.06); }
-                .sc2-sep-text { font-size: 11px; color: #444; }
-
-                .sc2-json-btn {
-                    width: 100%; height: 38px;
-                    background: transparent; border: 0.5px solid rgba(255,255,255,0.11);
-                    border-radius: 10px; color: #999; font-size: 13px; cursor: pointer;
-                    display: flex; align-items: center; justify-content: center; gap: 8px;
-                    transition: border-color .15s, color .15s, background .15s;
-                    box-sizing: border-box;
-                }
-                .sc2-json-btn:hover { border-color: rgba(29,185,84,0.45); color: #fff; background: rgba(29,185,84,0.08); }
-
-                .sc2-file-pill {
-                    display: none; align-items: center; gap: 8px;
-                    background: rgba(29,185,84,0.09);
-                    border: 0.5px solid rgba(29,185,84,0.22);
-                    border-radius: 8px; padding: 8px 10px; margin-top: 8px;
-                }
-                .sc2-pill-text { font-size: 12px; color: #1DB954; flex: 1; }
-                .sc2-pill-remove {
-                    background: transparent; border: none;
-                    color: rgba(29,185,84,0.5); cursor: pointer;
-                    font-size: 14px; padding: 2px;
-                }
-                .sc2-pill-remove:hover { color: #e85555; }
-
                 .sc2-notice {
                     background: rgba(29,185,84,0.06);
                     border: 0.5px solid rgba(29,185,84,0.18);
@@ -307,13 +311,14 @@
                     font-size: 14px; font-weight: 500; color: #fff;
                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 2px;
                 }
-                .sc2-prev-owner, .sc2-prev-count {
+                .sc2-prev-sub {
                     font-size: 11px; color: #777;
-                    display: flex; align-items: center; gap: 4px; margin-bottom: 2px;
+                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 2px;
                 }
                 .sc2-prev-badge {
                     font-size: 10px; font-weight: 600; padding: 3px 7px; border-radius: 4px;
                     background: rgba(29,185,84,0.12); color: #1DB954; border: 0.5px solid rgba(29,185,84,0.25);
+                    white-space: nowrap;
                 }
 
                 /* Single Track Destination Card */
@@ -422,15 +427,18 @@
                     width: 6px; height: 6px; border-radius: 50%;
                     background: #333; flex-shrink: 0; transition: background .3s;
                 }
-                .sc2-status-dot.active { background: #1DB954; }
+                .sc2-status-dot.active { background: #1DB954; animation: sc2-pulse 1s infinite; }
                 .sc2-status-dot.done   { background: #1DB954; }
                 .sc2-status-dot.err    { background: #e85555; }
+                @keyframes sc2-pulse {
+                    0%, 100% { opacity: 1; } 50% { opacity: 0.4; }
+                }
                 .sc2-status-txt { font-size: 11px; color: #555; flex: 1; }
             `;
             document.head.appendChild(s);
         },
 
-        // ── Modal Creation ──────────────────────────────────────────────────
+        // ── Modal Creation ───────────────────────────────────────────────────
         createModal() {
             const overlay = document.createElement('div');
             overlay.id = 'sc2-overlay';
@@ -450,7 +458,7 @@
                         <span class="sc2-sub">Universal Importer</span>
                     </div>
                     <div style="display:flex;align-items:center;gap:8px">
-                        <span class="sc2-chip">Unlimited</span>
+                        <span class="sc2-chip">v2.0</span>
                         <button class="sc2-icon-btn" id="sc2-close" aria-label="Close">✕</button>
                     </div>
                 </div>
@@ -458,28 +466,21 @@
                 <div class="sc2-two-col">
                     <div class="sc2-left">
                         <div>
-                            <div class="sc2-plabel">Source</div>
+                            <div class="sc2-plabel">Spotify URL</div>
                             <div class="sc2-url-card">
                                 <div class="sc2-field-wrap">
-                                    <input type="text" id="sc2-url" class="sc2-field" placeholder="Paste Spotify Playlist, Album, or Track URL..." autocomplete="off">
+                                    <input type="text" id="sc2-url" class="sc2-field"
+                                        placeholder="Paste playlist, album, or song URL…" autocomplete="off">
                                     <button class="sc2-field-x" id="sc2-field-x" aria-label="Clear">✕</button>
-                                </div>
-                                <div class="sc2-sep">
-                                    <div class="sc2-sep-line"></div>
-                                    <span class="sc2-sep-text">or</span>
-                                    <div class="sc2-sep-line"></div>
-                                </div>
-                                <label for="sc2-file" class="sc2-json-btn" id="sc2-json-label">Upload JSON backup</label>
-                                <input type="file" id="sc2-file" accept=".json" style="display:none">
-                                <div class="sc2-file-pill" id="sc2-pill">
-                                    <span class="sc2-pill-text" id="sc2-pill-text"></span>
-                                    <button class="sc2-pill-remove" id="sc2-pill-remove" aria-label="Remove file">✕</button>
                                 </div>
                             </div>
                         </div>
 
                         <div class="sc2-notice">
-                            Supports <strong>entire playlists</strong> (500+ tracks), <strong>albums</strong>, and <strong>single songs</strong>. Matches via <strong>saavan-search</strong> or <strong>qobuz-player</strong>.
+                            Paste any Spotify link:<br>
+                            <strong>🎵 Single song</strong> — choose where to save it<br>
+                            <strong>💿 Album</strong> — imports all tracks as a playlist<br>
+                            <strong>📋 Playlist</strong> — full import, no 500-song limit
                         </div>
 
                         <!-- Preview Card -->
@@ -487,39 +488,34 @@
                             <div class="sc2-prev-art" id="sc2-prev-art"></div>
                             <div class="sc2-prev-info">
                                 <div class="sc2-prev-name" id="sc2-prev-name">—</div>
-                                <div class="sc2-prev-owner" id="sc2-prev-owner" style="display:none">
-                                    <span id="sc2-prev-owner-text"></span>
-                                </div>
-                                <div class="sc2-prev-count">
-                                    <span id="sc2-prev-count"></span>
-                                </div>
+                                <div class="sc2-prev-sub" id="sc2-prev-sub"></div>
+                                <div class="sc2-prev-sub" id="sc2-prev-count" style="color:#555"></div>
                             </div>
-                            <div class="sc2-prev-badge" id="sc2-prev-badge">PLAYLIST</div>
+                            <div class="sc2-prev-badge" id="sc2-prev-badge">TRACK</div>
                         </div>
 
-                        <!-- Single Track Destination Selector -->
+                        <!-- Single Track Destination Selector (only shown for tracks) -->
                         <div class="sc2-dest-card" id="sc2-dest-card">
                             <div class="sc2-dest-title">Where to save this song?</div>
                             <label class="sc2-radio-row">
                                 <input type="radio" name="sc2-dest" value="library" checked>
-                                <span>Save directly to Main Library</span>
+                                <span>Save to Main Library</span>
                             </label>
                             <label class="sc2-radio-row">
                                 <input type="radio" name="sc2-dest" value="existing_playlist">
-                                <span>Add to Playlist:</span>
+                                <span>Add to existing playlist:</span>
                             </label>
                             <select id="sc2-dest-select" class="sc2-dest-select"></select>
-
                             <label class="sc2-radio-row">
                                 <input type="radio" name="sc2-dest" value="new_playlist">
-                                <span>Create New Playlist:</span>
+                                <span>Create new playlist:</span>
                             </label>
-                            <input type="text" id="sc2-dest-new-name" class="sc2-dest-input" placeholder="e.g. My Favorites">
+                            <input type="text" id="sc2-dest-new-name" class="sc2-dest-input" placeholder="Playlist name…">
                         </div>
 
                         <div class="sc2-actions">
                             <button class="sc2-btn-stop" id="sc2-stop" disabled>Stop</button>
-                            <button class="sc2-btn-convert" id="sc2-convert">Convert</button>
+                            <button class="sc2-btn-convert" id="sc2-convert" disabled>Paste a URL first</button>
                         </div>
                     </div>
 
@@ -552,7 +548,7 @@
                         <div class="sc2-log-wrap" id="sc2-log">
                             <div class="sc2-log-line info">
                                 <span class="sc2-log-arrow">›</span>
-                                <span class="sc2-log-msg">Ready. Paste a Spotify URL (playlist, album, or track) or upload a JSON backup.</span>
+                                <span class="sc2-log-msg">Ready. Paste a Spotify playlist, album, or track URL.</span>
                             </div>
                         </div>
 
@@ -568,20 +564,13 @@
             modal.querySelector('#sc2-close').onclick = () => this.close();
             modal.querySelector('#sc2-convert').onclick = () => this.startImportProcess();
             modal.querySelector('#sc2-stop').onclick = () => this.stopConversionProcess();
-            modal.querySelector('#sc2-file').addEventListener('change', e => this.handleFileUpload(e));
-            modal.querySelector('#sc2-pill-remove').onclick = () => this.clearFile();
 
+            // Clear button
             modal.querySelector('#sc2-field-x').addEventListener('click', () => {
-                modal.querySelector('#sc2-url').value = '';
-                modal.querySelector('#sc2-field-x').style.display = 'none';
-                modal.querySelector('#sc2-preview').style.display = 'none';
-                modal.querySelector('#sc2-dest-card').classList.remove('open');
-                this.singleTrackData = null;
-                this.detectedType = null;
-                modal.querySelector('#sc2-url').focus();
+                this.resetInput();
             });
 
-            // Instant auto-detection on URL paste or enter
+            // Auto-detect on paste
             const urlInput = modal.querySelector('#sc2-url');
             urlInput.addEventListener('input', () => {
                 const v = urlInput.value.trim();
@@ -602,20 +591,34 @@
             const btn = document.createElement('button');
             btn.className = 'plugin-menu-btn';
             btn.innerHTML = `
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M2 12h20M2 12l5-5m-5 5l5 5"/><circle cx="12" cy="12" r="10"/>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141 4.32-1.38 9.841-.719 13.44 1.56.42.3.6.84.3 1.26zm.12-3.36C14.939 8.46 8.641 8.28 5.1 9.421c-.6.18-1.26-.12-1.441-.72-.18-.6.12-1.26.72-1.44 4.08-1.26 11.04-1.02 15.361 1.56.6.358.779 1.14.421 1.74-.359.6-1.14.779-1.741.419z"/>
                 </svg>
-                <span>Spotify Universal Importer</span>
+                <span>Spotify Importer</span>
             `;
             btn.onclick = () => this.open();
             this.api.ui.registerSlot('playerbar:menu', btn);
+        },
+
+        resetInput() {
+            const modal = document.getElementById('sc2-modal');
+            if (!modal) return;
+            modal.querySelector('#sc2-url').value = '';
+            modal.querySelector('#sc2-field-x').style.display = 'none';
+            modal.querySelector('#sc2-preview').style.display = 'none';
+            modal.querySelector('#sc2-dest-card').classList.remove('open');
+            modal.querySelector('#sc2-convert').disabled = true;
+            modal.querySelector('#sc2-convert').textContent = 'Paste a URL first';
+            this.singleTrackData = null;
+            this.importedPlaylistData = null;
+            this.detectedType = null;
+            modal.querySelector('#sc2-url').focus();
         },
 
         async open() {
             this.isOpen = true;
             document.getElementById('sc2-overlay')?.classList.add('open');
             document.getElementById('sc2-modal')?.classList.add('open');
-            // Refresh playlists for destination picker
             try {
                 this.cachedPlaylists = (await this.api.library.getPlaylists()) || [];
             } catch (e) {
@@ -630,7 +633,7 @@
             document.getElementById('sc2-modal')?.classList.remove('open');
         },
 
-        // ── URL Detection & Preview ─────────────────────────────────────────
+        // ── URL Detection & Preview ──────────────────────────────────────────
         async onUrlEntered(rawUrl) {
             const str = rawUrl.trim();
             const trackMatch = str.match(/(?:track\/|track:)([a-zA-Z0-9]+)/);
@@ -639,97 +642,85 @@
 
             if (trackMatch) {
                 this.detectedType = 'track';
-                this.fetchAndPreviewSingleTrack(trackMatch[1], str);
+                document.getElementById('sc2-dest-card')?.classList.remove('open');
+                document.getElementById('sc2-convert').disabled = true;
+                document.getElementById('sc2-convert').textContent = 'Loading…';
+                await this.fetchAndPreviewSingleTrack(trackMatch[1]);
             } else if (playlistMatch) {
                 this.detectedType = 'playlist';
                 document.getElementById('sc2-dest-card')?.classList.remove('open');
-                document.getElementById('sc2-convert').textContent = 'Convert playlist';
-                this.fetchAndPreviewPlaylist(playlistMatch[1]);
+                document.getElementById('sc2-convert').disabled = true;
+                document.getElementById('sc2-convert').textContent = 'Loading…';
+                await this.fetchAndPreviewPlaylist(playlistMatch[1]);
             } else if (albumMatch) {
                 this.detectedType = 'album';
                 document.getElementById('sc2-dest-card')?.classList.remove('open');
-                document.getElementById('sc2-convert').textContent = 'Convert album';
-                this.fetchAndPreviewAlbum(albumMatch[1]);
+                document.getElementById('sc2-convert').disabled = true;
+                document.getElementById('sc2-convert').textContent = 'Loading…';
+                await this.fetchAndPreviewAlbum(albumMatch[1]);
             }
         },
 
-        // ── Single Track Handling ───────────────────────────────────────────
-        async fetchAndPreviewSingleTrack(trackId, rawUrl) {
-            this.log(`Loading Spotify track (ID: ${trackId})…`, 'info');
+        // ── SINGLE TRACK ────────────────────────────────────────────────────
+        async fetchAndPreviewSingleTrack(trackId) {
+            this.log(`Fetching track (ID: ${trackId})…`, 'info');
             this.setStatus('Loading track…', 'active');
 
             try {
                 let track = null;
 
-                // 1. Fetch via Spotify embed HTML (has exact __NEXT_DATA__ entity with true title and artist)
+                // Primary: parse Spotify embed page __NEXT_DATA__ (gives full artist info)
                 try {
-                    const embedRes = await this.api.fetch(`https://open.spotify.com/embed/track/${trackId}`);
-                    if (embedRes.ok) {
-                        const html = await embedRes.text();
-                        const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-                        if (nextDataMatch) {
-                            const nextData = JSON.parse(nextDataMatch[1]);
-                            const entity = nextData.props?.pageProps?.state?.data?.entity;
-                            if (entity) {
-                                track = {
-                                    title: entity.title || entity.name,
-                                    artist: (entity.artists || []).map(a => a.name).join(', ') || 'Unknown Artist',
-                                    album: '',
-                                    duration_ms: entity.duration || 180000,
-                                    cover_url: entity.visualIdentity?.image?.[0]?.url || null,
-                                    isrc: null
-                                };
-                            }
-                        }
-                    }
-                } catch (e) {
-                    console.warn('[SpotifyImporter] Embed parser fallback:', e);
-                }
-
-                // 2. Fallback to oEmbed if needed
-                if (!track) {
-                    const oembedUrl = `https://open.spotify.com/oembed?url=${encodeURIComponent(`https://open.spotify.com/track/${trackId}`)}`;
-                    const oembedRes = await this.api.fetch(oembedUrl);
-                    if (oembedRes.ok) {
-                        const data = await oembedRes.json();
-                        let title = data.title || 'Track';
-                        let artist = '';
-                        if (title.includes(' by ')) {
-                            const p = title.split(' by ');
-                            title = p[0].trim();
-                            artist = p[1].trim();
-                        }
+                    const { entity } = await this.fetchEmbedData('track', trackId);
+                    if (entity && entity.name) {
+                        const artists = (entity.artists || []).map(a => a.name).filter(Boolean);
                         track = {
-                            title: title,
-                            artist: artist,
-                            album: '',
-                            duration_ms: 180000,
-                            cover_url: data.thumbnail_url || null,
+                            title: entity.title || entity.name,
+                            artist: artists.join(', ') || 'Unknown Artist',
+                            album: entity.albumOfTrack?.name || '',
+                            duration_ms: entity.duration || 180000,
+                            cover_url: entity.visualIdentity?.image?.[0]?.url || null,
                             isrc: null
                         };
+                        this.log(`Found: "${track.title}" by ${track.artist}`, 'success');
+                    }
+                } catch (e) {
+                    this.log(`Embed parse failed, trying oEmbed…`, 'warn');
+                    console.warn('[SpotifyImporter] Embed track error:', e);
+                }
+
+                // Fallback: oEmbed (title + thumbnail, no artist)
+                if (!track) {
+                    try {
+                        const oembed = await this.fetchOEmbed('track', trackId);
+                        track = {
+                            title: oembed.title || 'Unknown Track',
+                            artist: '',
+                            album: '',
+                            duration_ms: 180000,
+                            cover_url: oembed.thumbnail_url || null,
+                            isrc: null
+                        };
+                        this.log(`oEmbed: "${track.title}" (artist unknown, will search by title)`, 'warn');
+                    } catch (e2) {
+                        console.error('[SpotifyImporter] oEmbed track error:', e2);
                     }
                 }
 
-                if (!track) throw new Error('Could not fetch Spotify track info.');
+                if (!track) throw new Error('Could not fetch any track data from Spotify.');
 
                 this.singleTrackData = track;
 
-                // Show Preview Card
-                const art = document.getElementById('sc2-prev-art');
-                if (track.cover_url) {
-                    art.innerHTML = `<img src="${track.cover_url}" alt="">`;
-                } else {
-                    art.innerHTML = `<span style="font-size:20px">🎵</span>`;
-                }
-                document.getElementById('sc2-prev-name').textContent = track.title;
-                document.getElementById('sc2-prev-owner').style.display = 'flex';
-                document.getElementById('sc2-prev-owner-text').textContent = track.artist || 'Single Track';
-                document.getElementById('sc2-prev-count').textContent = 'Single Track';
-                document.getElementById('sc2-prev-badge').textContent = 'TRACK';
-                document.getElementById('sc2-preview').style.display = 'flex';
+                // Show preview
+                this.showPreview({
+                    name: track.title,
+                    sub: track.artist || 'Unknown Artist',
+                    count: 'Single Track',
+                    badge: 'TRACK',
+                    image: track.cover_url
+                });
 
-                // Populate and show destination card
-                const destCard = document.getElementById('sc2-dest-card');
+                // Populate destination card
                 const selectEl = document.getElementById('sc2-dest-select');
                 if (selectEl) {
                     selectEl.innerHTML = '';
@@ -744,15 +735,15 @@
                         });
                     }
                 }
-                destCard.classList.add('open');
-                document.getElementById('sc2-convert').textContent = 'Save track';
-
-                this.log(`Track: "${track.title}" by ${track.artist}`, 'info');
-                this.setStatus('Ready to save', 'idle');
+                document.getElementById('sc2-dest-card').classList.add('open');
+                document.getElementById('sc2-convert').disabled = false;
+                document.getElementById('sc2-convert').textContent = 'Save track →';
+                this.setStatus('Ready', 'idle');
             } catch (err) {
                 console.error(err);
-                this.log(`Failed to fetch track: ${err.message}`, 'error');
-                this.setStatus('Error', 'err');
+                this.log(`Error: ${err.message}`, 'error');
+                this.setStatus('Failed to load track', 'err');
+                document.getElementById('sc2-convert').textContent = 'Paste a URL first';
             }
         },
 
@@ -762,82 +753,174 @@
 
             const convertBtn = document.getElementById('sc2-convert');
             convertBtn.disabled = true;
-            this.setStatus('Searching stream…', 'active');
-            this.log(`━━━━━━━━━━━━━━━━━━━━━━━`, 'divider');
-            this.log(`Searching audio sources for: "${track.title}" - ${track.artist}`, 'info');
+            convertBtn.textContent = 'Searching…';
+            this.setStatus('Searching audio stream…', 'active');
+            this.log('━━━━━━━━━━━━━━━━━━━━━━━', 'divider');
+            this.log(`Searching: "${track.title}"${track.artist ? ' — ' + track.artist : ''}`, 'info');
 
             try {
                 const results = await this.searchAllSources(track, null);
                 const best = this.pickBestResult(results);
 
                 if (!best) {
-                    this.log(`No match found on JioSaavn or Qobuz for "${track.title}".`, 'error');
+                    this.log(`No audio source found for "${track.title}".`, 'error');
                     this.updateStats(0, 0, 1);
                     this.setStatus('Not found', 'err');
                     convertBtn.disabled = false;
+                    convertBtn.textContent = 'Save track →';
                     return;
                 }
 
                 if (!best.cover_url && track.cover_url) best.cover_url = track.cover_url;
 
-                // Add to Audion library
                 const libraryId = await this.addTrackToLibrary(best);
-                this.log(`Added to library: "${best.title}" (${best.source_type})`, 'success');
+                this.log(`Added: "${best.title}" via ${best.source_type}`, 'success');
 
-                // Destination
                 const destVal = document.querySelector('input[name="sc2-dest"]:checked')?.value || 'library';
                 if (destVal === 'existing_playlist') {
                     const plId = document.getElementById('sc2-dest-select')?.value;
                     if (plId) {
                         await this.api.library.addTrackToPlaylist(plId, libraryId);
-                        this.log(`Added to selected playlist!`, 'success');
+                        this.log(`Added to playlist!`, 'success');
                     }
                 } else if (destVal === 'new_playlist') {
                     const newName = document.getElementById('sc2-dest-new-name')?.value?.trim() || `${track.title} Mix`;
                     const newPlId = await this.api.library.createPlaylist(newName, track.cover_url);
                     await this.api.library.addTrackToPlaylist(newPlId, libraryId);
                     this.log(`Created playlist "${newName}" and added track!`, 'success');
+                } else {
+                    this.log('Saved to Main Library.', 'success');
                 }
 
                 this.updateStats(1, 0, 0);
                 this.updateProgress(100);
                 this.setStatus('Saved!', 'done');
-                this.log(`Track successfully imported!`, 'success');
+                convertBtn.textContent = '✓ Saved';
             } catch (err) {
                 console.error(err);
-                this.log(`Error saving track: ${err.message}`, 'error');
+                this.log(`Error: ${err.message}`, 'error');
                 this.setStatus('Failed', 'err');
-            } finally {
                 convertBtn.disabled = false;
+                convertBtn.textContent = 'Save track →';
             }
         },
 
-        // ── Playlist & Album Fetching (Unlimited Pagination) ────────────────
+        // ── ALBUM ────────────────────────────────────────────────────────────
+        async fetchAndPreviewAlbum(albumId) {
+            this.log(`Fetching album (ID: ${albumId})…`, 'info');
+            this.setStatus('Loading album…', 'active');
+
+            try {
+                let albumData = null;
+
+                // Primary: Spotify embed page __NEXT_DATA__
+                try {
+                    const { entity } = await this.fetchEmbedData('album', albumId);
+                    if (entity && entity.name) {
+                        // Album artist comes from entity.subtitle
+                        const albumArtist = entity.subtitle || 'Unknown Artist';
+                        const coverUrl = entity.visualIdentity?.image?.[0]?.url || null;
+
+                        const tracks = (entity.trackList || []).map(t => {
+                            // Individual track artists may be in t.artists array
+                            const trackArtists = (t.artists || []).map(a => a.name).filter(Boolean);
+                            return {
+                                title: t.title || t.name || 'Unknown',
+                                // Use track-level artists if present, otherwise fall back to album artist
+                                artist: trackArtists.length > 0 ? trackArtists.join(', ') : albumArtist,
+                                album: entity.name,
+                                duration_ms: t.duration || 0,
+                                cover_url: coverUrl,
+                                isrc: null
+                            };
+                        });
+
+                        albumData = {
+                            title: entity.name,
+                            image: coverUrl,
+                            owner: albumArtist,
+                            total: tracks.length,
+                            tracks: tracks
+                        };
+                        this.log(`Album: "${albumData.title}" by ${albumArtist} — ${tracks.length} tracks`, 'success');
+                    }
+                } catch (e) {
+                    this.log(`Embed parse failed: ${e.message}`, 'warn');
+                    console.warn('[SpotifyImporter] Album embed error:', e);
+                }
+
+                // Fallback: oEmbed gives at least name + cover (no track list)
+                if (!albumData) {
+                    try {
+                        const oembed = await this.fetchOEmbed('album', albumId);
+                        albumData = {
+                            title: oembed.title || 'Unknown Album',
+                            image: oembed.thumbnail_url || null,
+                            owner: null,
+                            total: 0,
+                            tracks: []
+                        };
+                        this.log(`oEmbed fallback: "${albumData.title}" — track list unavailable`, 'warn');
+                    } catch (e2) {
+                        console.error('[SpotifyImporter] Album oEmbed error:', e2);
+                    }
+                }
+
+                if (!albumData) throw new Error('Could not fetch album data.');
+                if (albumData.tracks.length === 0) {
+                    this.log('Could not retrieve track list for this album.', 'error');
+                    this.setStatus('Album load failed', 'err');
+                    document.getElementById('sc2-convert').textContent = 'Paste a URL first';
+                    return;
+                }
+
+                this.importedPlaylistData = albumData;
+                this.showPreview({
+                    name: albumData.title,
+                    sub: albumData.owner || '',
+                    count: `${albumData.total} tracks`,
+                    badge: 'ALBUM',
+                    image: albumData.image
+                });
+                document.getElementById('sc2-convert').disabled = false;
+                document.getElementById('sc2-convert').textContent = 'Import album →';
+                this.setStatus('Ready to import', 'idle');
+            } catch (err) {
+                console.error(err);
+                this.log(`Album error: ${err.message}`, 'error');
+                this.setStatus('Failed', 'err');
+                document.getElementById('sc2-convert').textContent = 'Paste a URL first';
+            }
+        },
+
+        // ── PLAYLIST ─────────────────────────────────────────────────────────
         async fetchAndPreviewPlaylist(playlistId) {
-            this.log(`Loading playlist (ID: ${playlistId})…`, 'info');
+            this.log(`Fetching playlist (ID: ${playlistId})…`, 'info');
             this.setStatus('Loading playlist…', 'active');
 
             try {
-                // First attempt: Check embed page for live accessToken
-                let token = null;
-                try {
-                    const embedRes = await this.api.fetch(`https://open.spotify.com/embed/playlist/${playlistId}`);
-                    if (embedRes.ok) {
-                        const html = await embedRes.text();
-                        const tokenMatch = html.match(/"accessToken":"([^"]+)"/);
-                        if (tokenMatch) token = tokenMatch[1];
-                    }
-                } catch (e) { }
-
                 let playlistData = null;
+                let token = null;
 
-                // If token acquired from embed page, use official API with UNLIMITED pagination!
+                // Try to get a live session token from embed page (enables unlimited pagination)
+                try {
+                    const { entity, token: t } = await this.fetchEmbedData('playlist', playlistId);
+                    token = t;
+                    if (entity && entity.name) {
+                        this.log(`Loaded playlist info: "${entity.name}"`, 'info');
+                    }
+                } catch (e) {
+                    console.warn('[SpotifyImporter] Playlist embed error:', e);
+                }
+
+                // If we have a token, use official Spotify API (no limit!)
                 if (token) {
-                    this.log('Acquired Spotify session. Loading all pages with zero limits…', 'info');
+                    this.log('Session token found — using unlimited pagination…', 'info');
                     try {
-                        const metaRes = await this.api.fetch(`https://api.spotify.com/v1/playlists/${playlistId}?fields=name,description,images,owner,tracks.total`, {
-                            headers: { 'Authorization': `Bearer ${token}` }
-                        });
+                        const metaRes = await this.api.fetch(
+                            `https://api.spotify.com/v1/playlists/${playlistId}?fields=name,description,images,owner,tracks.total`,
+                            { headers: { 'Authorization': `Bearer ${token}` } }
+                        );
                         if (metaRes.ok) {
                             const meta = await metaRes.json();
                             const total = meta.tracks?.total || 0;
@@ -881,32 +964,41 @@
                             };
                         }
                     } catch (e) {
-                        console.warn('[SpotifyImporter] Official API paging error:', e);
+                        console.warn('[SpotifyImporter] Spotify API pagination error:', e);
                     }
                 }
 
-                // Fallback to Public Vercel Proxy if token method fails
+                // Fallback: public proxy (may cap at 499)
                 if (!playlistData) {
                     playlistData = await this.fetchPlaylistFromPublicAPI(playlistId);
                 }
 
                 this.importedPlaylistData = playlistData;
-                this.showPlaylistPreview(playlistData);
-                this.setStatus('Ready to convert', 'idle');
+                this.showPreview({
+                    name: playlistData.title,
+                    sub: playlistData.owner || '',
+                    count: `${playlistData.tracks.length} tracks`,
+                    badge: 'PLAYLIST',
+                    image: playlistData.image
+                });
+                document.getElementById('sc2-convert').disabled = false;
+                document.getElementById('sc2-convert').textContent = 'Import playlist →';
+                this.setStatus('Ready to import', 'idle');
             } catch (err) {
                 console.error(err);
                 this.log(`Error: ${err.message}`, 'error');
                 this.setStatus('Failed', 'err');
+                document.getElementById('sc2-convert').textContent = 'Paste a URL first';
             }
         },
 
         async fetchPlaylistFromPublicAPI(playlistId) {
-            this.log('Fetching playlist via public proxy…', 'info');
+            this.log('Using public proxy (may have 499-track limit)…', 'warn');
             const limit = 100;
             let offset = 0, allTracks = [], playlistMeta = null, total = 0, page = 1;
 
             while (true) {
-                const url = `${this.NEW_SPOTIFY_API_BASE}/${playlistId}?limit=${limit}&offset=${offset}`;
+                const url = `${this.PLAYLIST_API}/${playlistId}?limit=${limit}&offset=${offset}`;
                 const response = await this.api.fetch(url);
                 if (!response.ok) throw new Error(`API error: ${response.status}`);
                 const json = await response.json();
@@ -916,7 +1008,6 @@
                 if (!playlistMeta) {
                     playlistMeta = {
                         title: data.name || 'Spotify Import',
-                        description: data.description || '',
                         image: data.image || null,
                         owner: data.owner || null
                     };
@@ -935,9 +1026,7 @@
                 allTracks = allTracks.concat(pageTracks);
                 this.log(`Page ${page}: ${pageTracks.length} tracks (${allTracks.length}/${total})`, 'info');
 
-                if (!data.next || pageTracks.length === 0 || allTracks.length >= total) {
-                    break;
-                }
+                if (!data.next || pageTracks.length === 0 || allTracks.length >= total) break;
                 offset += limit;
                 page++;
             }
@@ -945,84 +1034,39 @@
             return { ...playlistMeta, total: allTracks.length, tracks: allTracks };
         },
 
-        async fetchAndPreviewAlbum(albumId) {
-            this.log(`Loading album (ID: ${albumId})…`, 'info');
-            this.setStatus('Loading album…', 'active');
-            try {
-                // Fetch embed page for album
-                const embedRes = await this.api.fetch(`https://open.spotify.com/embed/album/${albumId}`);
-                if (!embedRes.ok) throw new Error('Could not load album embed');
-                const html = await embedRes.text();
-                const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-                if (!nextDataMatch) throw new Error('Could not parse album data');
-                const nextData = JSON.parse(nextDataMatch[1]);
-                const entity = nextData.props?.pageProps?.state?.data?.entity;
-                if (!entity) throw new Error('Album metadata not found');
-
-                const albumTracks = (entity.trackList || []).map(t => ({
-                    title: t.title,
-                    artist: (t.artists || []).map(a => a.name).join(', ') || entity.subtitle || 'Unknown',
-                    album: entity.name,
-                    duration_ms: t.duration,
-                    cover_url: entity.visualIdentity?.image?.[0]?.url || null,
-                    isrc: null
-                }));
-
-                const albumData = {
-                    title: entity.name,
-                    image: entity.visualIdentity?.image?.[0]?.url || null,
-                    owner: entity.subtitle || null,
-                    total: albumTracks.length,
-                    tracks: albumTracks
-                };
-
-                this.importedPlaylistData = albumData;
-                this.showPlaylistPreview(albumData);
-                this.setStatus('Ready to convert', 'idle');
-            } catch (err) {
-                console.error(err);
-                this.log(`Album fetch error: ${err.message}`, 'error');
-                this.setStatus('Failed', 'err');
-            }
-        },
-
-        showPlaylistPreview(data) {
+        // ── Preview helper ───────────────────────────────────────────────────
+        showPreview({ name, sub, count, badge, image }) {
             const art = document.getElementById('sc2-prev-art');
-            if (data.image) {
-                art.innerHTML = `<img src="${data.image}" alt="">`;
+            if (image) {
+                art.innerHTML = `<img src="${image}" alt="">`;
             } else {
-                art.innerHTML = `<span style="font-size:20px">📁</span>`;
+                const icons = { TRACK: '🎵', ALBUM: '💿', PLAYLIST: '📋' };
+                art.innerHTML = `<span style="font-size:22px">${icons[badge] || '🎵'}</span>`;
             }
-            document.getElementById('sc2-prev-name').textContent = data.title || 'Playlist';
-            const ownerEl = document.getElementById('sc2-prev-owner');
-            if (data.owner) {
-                document.getElementById('sc2-prev-owner-text').textContent = data.owner;
-                ownerEl.style.display = 'flex';
-            } else {
-                ownerEl.style.display = 'none';
-            }
-            const total = data.total || data.tracks.length;
-            const fetched = data.tracks.length;
-            document.getElementById('sc2-prev-count').textContent =
-                (data.total && data.total > fetched) ? `${fetched} of ${total} tracks` : `${total} tracks`;
-            document.getElementById('sc2-prev-badge').textContent = 'PLAYLIST';
+            document.getElementById('sc2-prev-name').textContent = name || '—';
+            document.getElementById('sc2-prev-sub').textContent = sub || '';
+            document.getElementById('sc2-prev-count').textContent = count || '';
+            document.getElementById('sc2-prev-badge').textContent = badge || 'TRACK';
             document.getElementById('sc2-preview').style.display = 'flex';
         },
 
-        // ── Conversion Execution ────────────────────────────────────────────
+        // ── Conversion Execution ─────────────────────────────────────────────
         async startImportProcess() {
             if (this.detectedType === 'track') {
                 return this.saveSingleTrack();
             }
-
             // Playlist or Album
+            await this.runPlaylistImport();
+        },
+
+        async runPlaylistImport() {
             const convertBtn = document.getElementById('sc2-convert');
             const stopBtn = document.getElementById('sc2-stop');
             const urlEl = document.getElementById('sc2-url');
 
-            let playlistData = this.importedPlaylistData;
-            if (!playlistData) {
-                this.log('Please enter a valid Spotify URL or upload a JSON backup.', 'error');
+            const playlistData = this.importedPlaylistData;
+            if (!playlistData || playlistData.tracks.length === 0) {
+                this.log('No tracks to import.', 'error');
                 return;
             }
 
@@ -1034,20 +1078,20 @@
             urlEl.disabled = true;
             this.updateProgress(0);
             this.updateStats('—', '—', '—');
-            this.setStatus('Converting…', 'active');
+            this.setStatus('Importing…', 'active');
 
             document.getElementById('sc2-log').innerHTML = '';
             this.log('━━━━━━━━━━━━━━━━━━━━━━━', 'divider');
-            this.log(`Playlist: ${playlistData.title}`, 'info');
+            this.log(`Importing: ${playlistData.title}`, 'info');
             this.log(`${playlistData.tracks.length} tracks to process`, 'info');
             this.log('━━━━━━━━━━━━━━━━━━━━━━━', 'divider');
 
             try {
                 const existingTracks = await this.getLibraryIndex();
-                this.log(`${existingTracks.size} existing tracks in library index`, 'info');
+                this.log(`${existingTracks.size} tracks already in library`, 'info');
 
                 const audionPlaylistId = await this.api.library.createPlaylist(playlistData.title, playlistData.image);
-                this.log('Playlist created in Audion', 'success');
+                this.log('Playlist created in Audion ✓', 'success');
 
                 const total = playlistData.tracks.length;
                 let processed = 0, successes = 0, fromLibrary = 0, notFound = 0;
@@ -1059,7 +1103,7 @@
                     while (queue.length > 0 && !this.stopConversion) {
                         const item = queue.shift();
                         if (!item) break;
-                        const { track, idx } = item;
+                        const { track } = item;
                         const key = `${this.normalizeString(track.title)}|${this.normalizeString(track.artist)}`;
 
                         let trackId = null;
@@ -1108,7 +1152,6 @@
                             }
                         }
 
-                        // Add track to Audion Playlist
                         if (trackId && audionPlaylistId) {
                             try {
                                 await this.api.library.addTrackToPlaylist(audionPlaylistId, trackId);
@@ -1118,6 +1161,11 @@
                         processed++;
                         this.updateProgress((processed / total) * 100);
                         this.updateStats(successes, fromLibrary, notFound);
+                        if (trackId) {
+                            this.log(`✓ ${track.title}`, 'success');
+                        } else {
+                            this.log(`✗ ${track.title}`, 'error');
+                        }
                     }
                 };
 
@@ -1125,11 +1173,12 @@
                 await Promise.all(workers);
 
                 if (this.stopConversion) {
-                    this.log('Conversion stopped by user.', 'warn');
+                    this.log('Stopped by user.', 'warn');
                     this.setStatus('Stopped', 'idle');
                 } else {
-                    this.log(`Finished! Successfully added ${successes + fromLibrary} of ${total} songs to "${playlistData.title}".`, 'success');
-                    this.setStatus('Done', 'done');
+                    this.log(`━━━━━━━━━━━━━━━━━━━━━━━`, 'divider');
+                    this.log(`Done! ${successes + fromLibrary}/${total} tracks imported to "${playlistData.title}".`, 'success');
+                    this.setStatus('Done!', 'done');
                 }
             } catch (err) {
                 console.error(err);
@@ -1138,6 +1187,7 @@
             } finally {
                 this.isConverting = false;
                 convertBtn.disabled = false;
+                convertBtn.textContent = 'Import again';
                 stopBtn.disabled = true;
                 urlEl.disabled = false;
             }
@@ -1148,57 +1198,7 @@
             if (this.abortController) this.abortController.abort();
         },
 
-        // ── JSON Upload Handling ────────────────────────────────────────────
-        handleFileUpload(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-            this.log(`Reading ${file.name}…`, 'info');
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                try {
-                    const json = JSON.parse(e.target.result);
-                    let playlistData = {
-                        title: json.title || json.name || file.name.replace('.json', ''),
-                        image: json.image || json.cover_url || null,
-                        tracks: (Array.isArray(json) ? json : json.tracks || []).map(t => ({
-                            title: t.title || t.name || 'Unknown',
-                            artist: Array.isArray(t.artist) ? t.artist.join(', ') : (t.artist || 'Unknown'),
-                            album: t.album || '',
-                            duration_ms: t.duration_ms || 180000,
-                            cover_url: t.cover_url || t.image || null,
-                            isrc: t.isrc || null
-                        }))
-                    };
-                    this.importedPlaylistData = playlistData;
-                    this.detectedType = 'playlist';
-                    document.getElementById('sc2-pill-text').textContent = `${playlistData.tracks.length} tracks · ${file.name}`;
-                    document.getElementById('sc2-pill').style.display = 'flex';
-                    document.getElementById('sc2-json-label').style.display = 'none';
-                    document.getElementById('sc2-url').value = '';
-                    document.getElementById('sc2-url').placeholder = 'Using uploaded JSON…';
-                    document.getElementById('sc2-url').disabled = true;
-                    this.showPlaylistPreview(playlistData);
-                    this.log(`Loaded ${playlistData.tracks.length} tracks from JSON.`, 'success');
-                } catch (err) {
-                    this.log('Invalid JSON file.', 'error');
-                }
-            };
-            reader.readAsText(file);
-        },
-
-        clearFile() {
-            this.importedPlaylistData = null;
-            document.getElementById('sc2-file').value = '';
-            document.getElementById('sc2-url').value = '';
-            document.getElementById('sc2-url').disabled = false;
-            document.getElementById('sc2-url').placeholder = 'Paste Spotify Playlist, Album, or Track URL...';
-            document.getElementById('sc2-pill').style.display = 'none';
-            document.getElementById('sc2-json-label').style.display = 'flex';
-            document.getElementById('sc2-preview').style.display = 'none';
-            this.log('File removed.', 'info');
-        },
-
-        // ── Log & Stats Helpers ─────────────────────────────────────────────
+        // ── Log & Stats ──────────────────────────────────────────────────────
         log(msg, type = 'info') {
             const log = document.getElementById('sc2-log');
             if (!log) return;
